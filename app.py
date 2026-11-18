@@ -68,8 +68,6 @@ def load_engine():
             ctypes.c_int,                     # n2
             ctypes.c_int,                     # method (0=SSD, 1=NCC)
             ctypes.c_double,                  # ratio
-            ctypes.c_int,                     # cross_check
-            ctypes.c_int,                     # max_matches
             ctypes.POINTER(ctypes.c_int),     # out_i
             ctypes.POINTER(ctypes.c_int),     # out_j
             ctypes.POINTER(ctypes.c_double),  # out_score
@@ -160,7 +158,7 @@ def run_sift(lib, img: np.ndarray, xs: np.ndarray, ys: np.ndarray, sigma: float)
     return desc, orient, time_ms.value
 
 
-def run_matcher(lib, desc1, desc2, method: int, ratio: float, cross_check: bool):
+def run_matcher(lib, desc1, desc2, method: int, ratio: float):
     """Match descriptors. method: 0 = SSD, 1 = NCC. Returns (idx1, idx2, score, time_ms)."""
     d1 = np.ascontiguousarray(desc1, dtype=np.float32)
     d2 = np.ascontiguousarray(desc2, dtype=np.float32)
@@ -177,8 +175,6 @@ def run_matcher(lib, desc1, desc2, method: int, ratio: float, cross_check: bool)
         len(d2),
         method,
         ratio,
-        int(cross_check),
-        cap,
         out_i.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         out_j.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         out_s.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -255,249 +251,182 @@ def build_response_heatmap(response: np.ndarray):
 
 
 # --- UI Layout ---
-st.title("Feature Extraction: Harris & Shi-Tomasi (λ⁻)")
+st.title("Feature Extraction: Harris / Shi-Tomasi → SIFT → Matching")
 
 engine, expected_path = load_engine()
-if engine is None:
+if engine is None or not hasattr(engine, "compute_sift_descriptors"):
     st.error(
-        f"Shared library not found at `{expected_path}`.\n\n"
-        "Compile `engine.cpp` first:\n"
+        "Shared library missing or outdated. Compile `engine.cpp`:\n"
         "```bash\n"
-        "g++ -O3 -shared -static -o engine.dll engine.cpp\n"
+        "g++ -O3 -shared -static -o engine.dll engine.cpp          # Windows\n"
+        "g++ -O3 -shared -fPIC -o libengine.so engine.cpp          # Linux\n"
+        "g++ -O3 -shared -fPIC -o libengine.dylib engine.cpp       # macOS\n"
         "```"
     )
     st.stop()
-
-if not hasattr(engine, "compute_sift_descriptors"):
-    st.error(
-        "The compiled library is outdated (no SIFT / matching functions). Rebuild it:\n"
-        "```bash\n"
-        "# Windows\n"
-        "g++ -O3 -shared -static -o engine.dll engine.cpp\n"
-        "# Linux\n"
-        "g++ -O3 -shared -fPIC -o libengine.so engine.cpp\n"
-        "# macOS\n"
-        "g++ -O3 -shared -fPIC -o libengine.dylib engine.cpp\n"
-        "```"
-    )
-    st.stop()
-
-with st.sidebar:
-    st.header("Operator & Parameters")
-    operator = st.radio("Corner Operator", ["Harris (R)", "Shi-Tomasi (λ⁻)"])
-    method_id = 0 if operator == "Harris (R)" else 1
-
-    gauss_ksize = st.select_slider(
-        "Gaussian Window Size", options=[3, 5, 7, 9, 11], value=5
-    )
-    sigma = st.slider("Gaussian Sigma (σ)", 0.5, 5.0, 1.0, step=0.1)
-
-    if method_id == 0:
-        k_val = st.slider("Harris k", 0.01, 0.15, 0.04, step=0.005, format="%.3f")
-    else:
-        k_val = 0.04
-
-    threshold_ratio = st.slider(
-        "Threshold (% of max response)", 0.1, 25.0, 1.0, step=0.1
-    ) / 100.0
-
-    nms_window = st.select_slider(
-        "NMS Window Size", options=[3, 5, 7, 9, 11, 15], value=5
-    )
-
-    st.divider()
-    st.header("SIFT Descriptors (on Harris points)")
-    sift_sigma = st.slider("Descriptor scale (σ)", 1.0, 4.0, 2.0, step=0.1)
-    max_kp = st.slider(
-        "Max keypoints per image (strongest first)", 100, 5000, 1500, step=100
-    )
-
-    st.header("Matching")
-    ratio = st.slider("Ratio test threshold", 0.5, 1.0, 0.8, step=0.05,
-                      help="1.0 disables the ratio test.")
-    cross_check = st.checkbox("Cross-check (mutual best match)", value=True)
-
-    st.divider()
-    st.header("Input & Display")
-    force_gs = st.checkbox(
-        "Force Grayscale (override RGB)",
-        value=False,
-        help="By default, 2D images run Grayscale and 3-channel images run RGB tensor Harris.",
-    )
-    marker_radius = st.slider("Marker Radius (px)", 1, 8, 3)
 
 uploaded_files = st.file_uploader(
-    "Upload one or more images (grayscale or color)",
+    "Upload images (grayscale or color)",
     type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
     accept_multiple_files=True,
 )
+force_gs = st.checkbox("Force grayscale (convert color images)", value=False)
 
 if not uploaded_files:
-    st.info("Upload one or more images to run the C++ corner detector.")
+    st.info("Upload one or more images to start.")
     st.stop()
 
-results = []
+images = []
 for f in uploaded_files:
     img = decode_uploaded_image(f, force_gs)
     if img is None:
         st.warning(f"Could not decode `{f.name}`.")
-        continue
-
-    xs, ys, scores, resp, elapsed_ms = run_detector(
-        engine, img, method_id, gauss_ksize, sigma, k_val, threshold_ratio, nms_window
-    )
-    # SIFT descriptors computed on the strongest Harris keypoints (already sorted by score)
-    sift_x, sift_y = xs[:max_kp], ys[:max_kp]
-    desc, orient, sift_ms = run_sift(engine, img, sift_x, sift_y, sift_sigma)
-
-    results.append(
-        {
-            "name": f.name,
-            "img": img,
-            "xs": xs,
-            "ys": ys,
-            "scores": scores,
-            "response": resp,
-            "time_ms": elapsed_ms,
-            "sift_x": sift_x,
-            "sift_y": sift_y,
-            "desc": desc,
-            "orient": orient,
-            "sift_ms": sift_ms,
-        }
-    )
-
-if not results:
+    else:
+        images.append({"name": f.name, "img": img})
+if not images:
     st.stop()
 
-# Computation time report (Harris + SIFT) for all images
-st.subheader("Computation Time Report")
-summary_rows = [
-    {
-        "Image": r["name"],
-        "Resolution": f"{r['img'].shape[1]} × {r['img'].shape[0]}",
-        "Mode": "Grayscale (1 ch)" if r["img"].ndim == 2 else "RGB (3 ch)",
-        "Operator": operator,
-        "Corners Found": len(r["xs"]),
-        "Harris/λ⁻ Time (ms)": round(r["time_ms"], 3),
-        "SIFT Keypoints": len(r["sift_x"]),
-        "SIFT Time (ms)": round(r["sift_ms"], 3),
-    }
-    for r in results
-]
-st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-
-if len(results) > 1:
-    selected_name = st.selectbox("Inspect Image", [r["name"] for r in results])
-    current = next(r for r in results if r["name"] == selected_name)
-else:
-    current = results[0]
-
-# Metrics for the selected image
-mode_label = "Grayscale (1-ch)" if current["img"].ndim == 2 else "RGB (3-ch)"
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Input Mode", mode_label)
-c2.metric("Resolution", f"{current['img'].shape[1]} × {current['img'].shape[0]}")
-c3.metric("Corners Detected", f"{len(current['xs']):,}")
-c4.metric("Harris/λ⁻ Time", f"{current['time_ms']:.3f} ms")
-c5.metric("SIFT Time", f"{current['sift_ms']:.3f} ms")
-
-# Visual inspection
-overlay = draw_corners(current["img"], current["xs"], current["ys"], marker_radius)
-heatmap = build_response_heatmap(current["response"])
-
-col_left, col_right = st.columns(2)
-with col_left:
-    st.subheader("Detected Corners")
-    st.image(overlay, use_container_width=True)
-
-with col_right:
-    st.subheader(f"{operator} Response Map (Log Scale)")
-    st.image(heatmap, use_container_width=True)
-
-
-# ---------------------------------------------------------------------------
-# SIFT descriptors on Harris keypoints
-# ---------------------------------------------------------------------------
-st.divider()
-st.header("SIFT Descriptors")
-st.caption(
-    f"{len(current['sift_x'])} Harris keypoints → 128-D descriptors "
-    f"(4×4 cells × 8 orientation bins) in {current['sift_ms']:.3f} ms. "
-    "Circles show the descriptor support; the line shows the dominant orientation."
+tab_corners, tab_sift, tab_match = st.tabs(
+    ["1. Harris / Shi-Tomasi", "2. SIFT", "3. Matching"]
 )
 
+# ---------------------------------------------------------------------------
+# Tab 1: corner detection
+# ---------------------------------------------------------------------------
+with tab_corners:
+    operator = st.radio("Corner operator", ["Harris (R)", "Shi-Tomasi (λ⁻)"], horizontal=True)
+    method_id = 0 if operator == "Harris (R)" else 1
 
-def draw_sift_keypoints(r, limit: int = 300):
-    canvas = cv2.cvtColor(r["img"], cv2.COLOR_GRAY2RGB) if r["img"].ndim == 2 else r["img"].copy()
-    rad = int(round(3 * sift_sigma * 2.5))
-    for x, y, th in list(zip(r["sift_x"], r["sift_y"], r["orient"]))[:limit]:
-        cv2.circle(canvas, (int(x), int(y)), rad, (60, 220, 60), 1, cv2.LINE_AA)
-        end = (int(x + rad * np.cos(th)), int(y + rad * np.sin(th)))
-        cv2.line(canvas, (int(x), int(y)), end, (255, 60, 60), 1, cv2.LINE_AA)
-    return canvas
+    p1, p2, p3, p4, p5 = st.columns(5)
+    gauss_ksize = p1.select_slider("Gaussian window", options=[3, 5, 7, 9, 11], value=5)
+    sigma = p2.slider("Gaussian σ", 0.5, 5.0, 1.0, step=0.1)
+    k_val = p3.slider("Harris k", 0.01, 0.15, 0.04, step=0.005, format="%.3f",
+                      disabled=(method_id == 1))
+    threshold_ratio = p4.slider("Threshold (% of max)", 0.1, 25.0, 1.0, step=0.1) / 100.0
+    nms_window = p5.select_slider("NMS window", options=[3, 5, 7, 9, 11, 15], value=5)
+    marker_radius = st.slider("Marker radius (px)", 1, 8, 3)
 
-
-st.image(draw_sift_keypoints(current), use_container_width=True)
-if len(current["desc"]):
-    with st.expander("Descriptor matrix preview (first 5 keypoints)"):
-        st.dataframe(
-            pd.DataFrame(current["desc"][:5]).round(4), use_container_width=True
+    for r in images:
+        r["xs"], r["ys"], r["scores"], r["response"], r["time_ms"] = run_detector(
+            engine, r["img"], method_id, gauss_ksize, sigma, k_val, threshold_ratio, nms_window
         )
 
-# ---------------------------------------------------------------------------
-# Feature matching: SSD vs NCC
-# ---------------------------------------------------------------------------
-st.divider()
-st.header("Feature Matching (SSD vs NCC)")
-
-if len(results) < 2:
-    st.info("Upload at least two images to match their SIFT features.")
-    st.stop()
-
-names = [r["name"] for r in results]
-mc1, mc2 = st.columns(2)
-name_a = mc1.selectbox("Image A", names, index=0)
-name_b = mc2.selectbox("Image B", names, index=1)
-img_a = next(r for r in results if r["name"] == name_a)
-img_b = next(r for r in results if r["name"] == name_b)
-
-rows = []
-match_data = {}
-for label, mid in (("SSD", 0), ("NCC", 1)):
-    i1, i2, sc, t_ms = run_matcher(engine, img_a["desc"], img_b["desc"], mid, ratio, cross_check)
-    match_data[label] = (i1, i2, sc)
-    rows.append(
-        {
-            "Method": label,
-            "Descriptors A": len(img_a["desc"]),
-            "Descriptors B": len(img_b["desc"]),
-            "Matches": len(i1),
-            "Matching Time (ms)": round(t_ms, 3),
-            "Mean Score": round(float(sc.mean()), 4) if len(sc) else None,
-        }
+    st.subheader("Computation time")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Image": r["name"],
+                    "Resolution": f"{r['img'].shape[1]} × {r['img'].shape[0]}",
+                    "Mode": "Grayscale" if r["img"].ndim == 2 else "RGB",
+                    "Operator": operator,
+                    "Corners": len(r["xs"]),
+                    "Time (ms)": round(r["time_ms"], 3),
+                }
+                for r in images
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
     )
-st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-st.caption("SSD: lower score = better match.  NCC: score in [-1, 1], higher = better match.")
 
-tab_ssd, tab_ncc = st.tabs(["SSD matches", "NCC matches"])
-for tab, label in ((tab_ssd, "SSD"), (tab_ncc, "NCC")):
-    with tab:
-        i1, i2, _ = match_data[label]
-        if len(i1) == 0:
-            st.warning("No matches found. Try a higher ratio threshold or disable cross-check.")
-        else:
-            st.image(draw_matches(img_a, img_b, i1, i2), use_container_width=True)
+    cur = st.selectbox("Inspect image", [r["name"] for r in images], key="inspect_corners")
+    cur = next(r for r in images if r["name"] == cur)
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Detected corners")
+        st.image(draw_corners(cur["img"], cur["xs"], cur["ys"], marker_radius),
+                 width="stretch")
+    with right:
+        st.subheader("Response map (log scale)")
+        st.image(build_response_heatmap(cur["response"]), width="stretch")
 
-if len(results) > 2 and st.checkbox("Run matching report for all image pairs"):
-    pair_rows = []
-    for a_i in range(len(results)):
-        for b_i in range(a_i + 1, len(results)):
-            ra, rb = results[a_i], results[b_i]
-            row = {"Pair": f"{ra['name']}  ↔  {rb['name']}"}
-            for label, mid in (("SSD", 0), ("NCC", 1)):
-                i1, _, _, t_ms = run_matcher(engine, ra["desc"], rb["desc"], mid, ratio, cross_check)
-                row[f"{label} Matches"] = len(i1)
-                row[f"{label} Time (ms)"] = round(t_ms, 3)
-            pair_rows.append(row)
-    st.dataframe(pd.DataFrame(pair_rows), use_container_width=True, hide_index=True)
+# ---------------------------------------------------------------------------
+# Tab 2: SIFT descriptors on the detected keypoints
+# ---------------------------------------------------------------------------
+with tab_sift:
+    st.caption(f"SIFT is computed on the {operator} keypoints from tab 1 (strongest first).")
+    s1, s2 = st.columns(2)
+    sift_sigma = s1.slider("Descriptor scale (σ)", 1.0, 4.0, 2.0, step=0.1)
+    max_kp = s2.slider("Max keypoints per image", 100, 5000, 1500, step=100)
+
+    for r in images:
+        r["sift_x"], r["sift_y"] = r["xs"][:max_kp], r["ys"][:max_kp]
+        r["desc"], r["orient"], r["sift_ms"] = run_sift(
+            engine, r["img"], r["sift_x"], r["sift_y"], sift_sigma
+        )
+
+    st.subheader("Computation time")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Image": r["name"],
+                    "Keypoints": len(r["sift_x"]),
+                    "Descriptor size": "128",
+                    "Time (ms)": round(r["sift_ms"], 3),
+                }
+                for r in images
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    cur = st.selectbox("Inspect image", [r["name"] for r in images], key="inspect_sift")
+    cur = next(r for r in images if r["name"] == cur)
+
+    canvas = cv2.cvtColor(cur["img"], cv2.COLOR_GRAY2RGB) if cur["img"].ndim == 2 else cur["img"].copy()
+    rad = int(round(3 * sift_sigma * 2.5))
+    for x, y, th in list(zip(cur["sift_x"], cur["sift_y"], cur["orient"]))[:300]:
+        cv2.circle(canvas, (int(x), int(y)), rad, (60, 220, 60), 1, cv2.LINE_AA)
+        cv2.line(canvas, (int(x), int(y)),
+                 (int(x + rad * np.cos(th)), int(y + rad * np.sin(th))), (255, 60, 60), 1, cv2.LINE_AA)
+    st.caption("Circle = descriptor support region, red line = dominant orientation (first 300 keypoints).")
+    st.image(canvas, width="stretch")
+
+# ---------------------------------------------------------------------------
+# Tab 3: matching (SSD vs NCC)
+# ---------------------------------------------------------------------------
+with tab_match:
+    if len(images) < 2:
+        st.info("Upload at least two images to match their features.")
+    else:
+        names = [r["name"] for r in images]
+        m1, m2, m3 = st.columns(3)
+        name_a = m1.selectbox("Image A", names, index=0)
+        name_b = m2.selectbox("Image B", names, index=1)
+        ratio = m3.slider("Ratio test threshold", 0.5, 1.0, 0.8, step=0.05,
+                          help="Lower = fewer but more reliable matches. 1.0 disables the test.")
+        ra = next(r for r in images if r["name"] == name_a)
+        rb = next(r for r in images if r["name"] == name_b)
+
+        out = {}
+        for label, mid in (("SSD", 0), ("NCC", 1)):
+            out[label] = run_matcher(engine, ra["desc"], rb["desc"], mid, ratio)
+
+        st.subheader("Computation time")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Method": label,
+                        "Descriptors A": len(ra["desc"]),
+                        "Descriptors B": len(rb["desc"]),
+                        "Matches": len(out[label][0]),
+                        "Time (ms)": round(out[label][3], 3),
+                    }
+                    for label in ("SSD", "NCC")
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+        for label in ("SSD", "NCC"):
+            i1, i2, _, _ = out[label]
+            st.subheader(f"{label} matches")
+            if len(i1) == 0:
+                st.warning("No matches. Try a higher ratio threshold.")
+            else:
+                st.image(draw_matches(ra, rb, i1, i2), width="stretch")
