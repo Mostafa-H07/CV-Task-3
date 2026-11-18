@@ -84,53 +84,49 @@ void gaussian_blur_2d(
 }
 
 // ---------------------------------------------------------------------------
-// SIFT descriptor helpers (applied on top of already-detected Harris keypoints)
+// SIFT descriptor (computed at already-detected Harris / Shi-Tomasi keypoints)
 // ---------------------------------------------------------------------------
 constexpr double PI_D = 3.14159265358979323846;
-constexpr int SIFT_D = 4;                       // 4x4 spatial grid
-constexpr int SIFT_NB = 8;                      // 8 orientation bins per cell
-constexpr int SIFT_DIM = SIFT_D * SIFT_D * SIFT_NB;  // 128
-constexpr int ORI_BINS = 36;
+constexpr int GRID = 4;                      // 4x4 spatial cells
+constexpr int NBINS = 8;                     // 8 orientation bins per cell
+constexpr int DIM = GRID * GRID * NBINS;     // 128
+constexpr int ORI_BINS = 36;                 // bins for the dominant-orientation histogram
 
-// RGB -> luminance (or plain copy for grayscale), scaled to [0, 1]
+// Grayscale in [0,1]; RGB uses luminance
 void to_gray(const uint8_t* img, int h, int w, int ch, std::vector<double>& g) {
-    g.assign(static_cast<size_t>(h) * w, 0.0);
+    g.resize(static_cast<size_t>(h) * w);
     for (size_t i = 0; i < g.size(); ++i) {
-        if (ch == 1) {
-            g[i] = img[i] / 255.0;
-        } else {
-            g[i] = (0.299 * img[i * 3] + 0.587 * img[i * 3 + 1] + 0.114 * img[i * 3 + 2]) / 255.0;
-        }
+        g[i] = (ch == 1)
+            ? img[i] / 255.0
+            : (0.299 * img[i * 3] + 0.587 * img[i * 3 + 1] + 0.114 * img[i * 3 + 2]) / 255.0;
     }
 }
 
-// Central-difference gradient magnitude and orientation ([0, 2*pi)) for every pixel
+// Gradient magnitude and angle ([0, 2pi)) per pixel (central differences)
 void gradient_maps(const std::vector<double>& g, int h, int w,
                    std::vector<double>& mag, std::vector<double>& ang) {
-    mag.assign(g.size(), 0.0);
-    ang.assign(g.size(), 0.0);
+    mag.resize(g.size());
+    ang.resize(g.size());
     for (int r = 0; r < h; ++r) {
         for (int c = 0; c < w; ++c) {
             double dx = 0.5 * (g[static_cast<size_t>(r) * w + clamp_idx(c + 1, w)] -
                                g[static_cast<size_t>(r) * w + clamp_idx(c - 1, w)]);
             double dy = 0.5 * (g[static_cast<size_t>(clamp_idx(r + 1, h)) * w + c] -
                                g[static_cast<size_t>(clamp_idx(r - 1, h)) * w + c]);
-            size_t idx = static_cast<size_t>(r) * w + c;
-            mag[idx] = std::sqrt(dx * dx + dy * dy);
+            size_t i = static_cast<size_t>(r) * w + c;
+            mag[i] = std::sqrt(dx * dx + dy * dy);
             double a = std::atan2(dy, dx);
-            if (a < 0) a += 2.0 * PI_D;
-            ang[idx] = a;
+            ang[i] = (a < 0) ? a + 2.0 * PI_D : a;
         }
     }
 }
 
-// Dominant gradient orientation around (x, y): 36-bin Gaussian-weighted histogram,
-// smoothed, peak refined by parabolic interpolation. Returns angle in [0, 2*pi).
+// Step 1 - orientation: Gaussian-weighted histogram of gradient angles around the
+// keypoint; the strongest bin is the keypoint's dominant orientation.
 double dominant_orientation(const std::vector<double>& mag, const std::vector<double>& ang,
                             int h, int w, int x, int y, double sigma) {
     double s = 1.5 * sigma;
     int rad = static_cast<int>(std::round(3.0 * s));
-    double inv2s2 = 1.0 / (2.0 * s * s);
     double hist[ORI_BINS] = {0};
 
     for (int dy = -rad; dy <= rad; ++dy) {
@@ -139,44 +135,25 @@ double dominant_orientation(const std::vector<double>& mag, const std::vector<do
         for (int dx = -rad; dx <= rad; ++dx) {
             int c = x + dx;
             if (c < 1 || c >= w - 1) continue;
-            size_t idx = static_cast<size_t>(r) * w + c;
-            double wgt = std::exp(-(dx * dx + dy * dy) * inv2s2) * mag[idx];
-            int bin = static_cast<int>(std::floor(ang[idx] * ORI_BINS / (2.0 * PI_D) + 0.5)) % ORI_BINS;
-            hist[bin] += wgt;
+            size_t i = static_cast<size_t>(r) * w + c;
+            int bin = static_cast<int>(ang[i] * ORI_BINS / (2.0 * PI_D)) % ORI_BINS;
+            hist[bin] += std::exp(-(dx * dx + dy * dy) / (2.0 * s * s)) * mag[i];
         }
-    }
-
-    // circular smoothing
-    for (int it = 0; it < 6; ++it) {
-        double tmp[ORI_BINS];
-        for (int i = 0; i < ORI_BINS; ++i) {
-            tmp[i] = (hist[(i + ORI_BINS - 1) % ORI_BINS] + hist[i] + hist[(i + 1) % ORI_BINS]) / 3.0;
-        }
-        std::copy(tmp, tmp + ORI_BINS, hist);
     }
 
     int best = 0;
     for (int i = 1; i < ORI_BINS; ++i) if (hist[i] > hist[best]) best = i;
-
-    double l = hist[(best + ORI_BINS - 1) % ORI_BINS];
-    double m = hist[best];
-    double rr = hist[(best + 1) % ORI_BINS];
-    double denom = l - 2.0 * m + rr;
-    double offset = (std::fabs(denom) > 1e-12) ? 0.5 * (l - rr) / denom : 0.0;
-
-    double theta = (best + offset) * 2.0 * PI_D / ORI_BINS;
-    if (theta < 0) theta += 2.0 * PI_D;
-    if (theta >= 2.0 * PI_D) theta -= 2.0 * PI_D;
-    return theta;
+    return (best + 0.5) * 2.0 * PI_D / ORI_BINS;
 }
 
-// 128-D SIFT descriptor (4x4 cells x 8 bins, trilinear interpolation, rotated to theta)
+// Step 2 - descriptor: rotate the patch to the dominant orientation, split it into
+// 4x4 cells, build an 8-bin gradient-orientation histogram per cell (128 values).
 void sift_descriptor(const std::vector<double>& mag, const std::vector<double>& ang,
                      int h, int w, int x, int y, double sigma, double theta, float* out) {
-    double hist_w = 3.0 * sigma;  // width of one spatial cell in pixels
-    int rad = static_cast<int>(std::round(hist_w * std::sqrt(2.0) * (SIFT_D + 1) * 0.5));
-    double cos_t = std::cos(theta), sin_t = std::sin(theta);
-    double hist[SIFT_D][SIFT_D][SIFT_NB] = {};
+    double cell = 3.0 * sigma;                                    // cell width in pixels
+    int rad = static_cast<int>(std::round(cell * std::sqrt(2.0) * (GRID + 1) * 0.5));
+    double ct = std::cos(theta), st = std::sin(theta);
+    double hist[GRID][GRID][NBINS] = {};
 
     for (int dy = -rad; dy <= rad; ++dy) {
         int r = y + dy;
@@ -185,115 +162,55 @@ void sift_descriptor(const std::vector<double>& mag, const std::vector<double>& 
             int c = x + dx;
             if (c < 1 || c >= w - 1) continue;
 
-            // rotate the sample into the keypoint's canonical frame, in cell units
-            double cr = (cos_t * dx + sin_t * dy) / hist_w;
-            double rr = (-sin_t * dx + cos_t * dy) / hist_w;
-            double rbin = rr + SIFT_D / 2.0 - 0.5;
-            double cbin = cr + SIFT_D / 2.0 - 0.5;
-            if (rbin <= -1.0 || rbin >= SIFT_D || cbin <= -1.0 || cbin >= SIFT_D) continue;
+            // sample position in the rotated frame, in cell units (centered on keypoint)
+            double u = ( ct * dx + st * dy) / cell;               // column direction
+            double v = (-st * dx + ct * dy) / cell;               // row direction
+            double cb = u + GRID / 2.0 - 0.5;
+            double rb = v + GRID / 2.0 - 0.5;
+            if (rb <= -1.0 || rb >= GRID || cb <= -1.0 || cb >= GRID) continue;
 
-            size_t idx = static_cast<size_t>(r) * w + c;
-            double a = ang[idx] - theta;
-            while (a < 0) a += 2.0 * PI_D;
-            while (a >= 2.0 * PI_D) a -= 2.0 * PI_D;
-            double obin = a * SIFT_NB / (2.0 * PI_D);
+            size_t i = static_cast<size_t>(r) * w + c;
+            double a = ang[i] - theta;                            // angle relative to keypoint
+            if (a < 0) a += 2.0 * PI_D;
+            double ob = a * NBINS / (2.0 * PI_D);
 
-            double wgt = std::exp(-(rr * rr + cr * cr) / (0.5 * SIFT_D * SIFT_D)) * mag[idx];
+            // weight = gradient magnitude * Gaussian centered on the keypoint
+            double wgt = mag[i] * std::exp(-(u * u + v * v) / (0.5 * GRID * GRID));
 
-            int r0 = static_cast<int>(std::floor(rbin));
-            int c0 = static_cast<int>(std::floor(cbin));
-            int o0 = static_cast<int>(std::floor(obin));
-            double fr = rbin - r0, fc = cbin - c0, fo = obin - o0;
+            // trilinear split between the neighbouring row / column / orientation bins
+            int r0 = static_cast<int>(std::floor(rb));
+            int c0 = static_cast<int>(std::floor(cb));
+            int o0 = static_cast<int>(std::floor(ob));
+            double fr = rb - r0, fc = cb - c0, fo = ob - o0;
 
-            for (int i = 0; i < 2; ++i) {
-                int ri = r0 + i;
-                if (ri < 0 || ri >= SIFT_D) continue;
-                double wr = wgt * (i ? fr : 1.0 - fr);
-                for (int j = 0; j < 2; ++j) {
-                    int ci = c0 + j;
-                    if (ci < 0 || ci >= SIFT_D) continue;
-                    double wc = wr * (j ? fc : 1.0 - fc);
-                    for (int k = 0; k < 2; ++k) {
-                        int oi = (o0 + k) % SIFT_NB;
-                        hist[ri][ci][oi] += wc * (k ? fo : 1.0 - fo);
+            for (int i2 = 0; i2 < 2; ++i2) {
+                int rr = r0 + i2;
+                if (rr < 0 || rr >= GRID) continue;
+                for (int j2 = 0; j2 < 2; ++j2) {
+                    int cc = c0 + j2;
+                    if (cc < 0 || cc >= GRID) continue;
+                    for (int k2 = 0; k2 < 2; ++k2) {
+                        hist[rr][cc][(o0 + k2) % NBINS] += wgt
+                            * (i2 ? fr : 1.0 - fr) * (j2 ? fc : 1.0 - fc) * (k2 ? fo : 1.0 - fo);
                     }
                 }
             }
         }
     }
 
-    // flatten -> normalize -> clip at 0.2 -> renormalize (illumination invariance)
-    double v[SIFT_DIM];
-    int n = 0;
-    for (int i = 0; i < SIFT_D; ++i)
-        for (int j = 0; j < SIFT_D; ++j)
-            for (int k = 0; k < SIFT_NB; ++k) v[n++] = hist[i][j][k];
-
+    // Step 3 - normalize, clip large values at 0.2, normalize again (lighting robustness)
+    double* d = &hist[0][0][0];
     for (int pass = 0; pass < 2; ++pass) {
         double norm = 0.0;
-        for (int i = 0; i < SIFT_DIM; ++i) norm += v[i] * v[i];
+        for (int i = 0; i < DIM; ++i) norm += d[i] * d[i];
         norm = std::sqrt(norm);
         if (norm < 1e-12) norm = 1.0;
-        for (int i = 0; i < SIFT_DIM; ++i) {
-            v[i] /= norm;
-            if (pass == 0 && v[i] > 0.2) v[i] = 0.2;
+        for (int i = 0; i < DIM; ++i) {
+            d[i] /= norm;
+            if (pass == 0 && d[i] > 0.2) d[i] = 0.2;
         }
     }
-    for (int i = 0; i < SIFT_DIM; ++i) out[i] = static_cast<float>(v[i]);
-}
-
-// For each row of A, find nearest row in B (and second-nearest distance).
-// method 0: dist = SSD;  method 1: dist = 1 - NCC (A, B must be zero-mean & unit-norm).
-void nearest_neighbours(const std::vector<float>& A, int na, const std::vector<float>& B, int nb,
-                        int method, std::vector<int>& idx, std::vector<double>& d1,
-                        std::vector<double>& d2) {
-    idx.assign(na, -1);
-    d1.assign(na, std::numeric_limits<double>::infinity());
-    d2.assign(na, std::numeric_limits<double>::infinity());
-    for (int i = 0; i < na; ++i) {
-        const float* a = &A[static_cast<size_t>(i) * SIFT_DIM];
-        for (int j = 0; j < nb; ++j) {
-            const float* b = &B[static_cast<size_t>(j) * SIFT_DIM];
-            double acc = 0.0;
-            if (method == 0) {
-                for (int k = 0; k < SIFT_DIM; ++k) {
-                    double d = static_cast<double>(a[k]) - b[k];
-                    acc += d * d;
-                }
-            } else {
-                for (int k = 0; k < SIFT_DIM; ++k) acc += static_cast<double>(a[k]) * b[k];
-                acc = 1.0 - acc;
-            }
-            if (acc < d1[i]) {
-                d2[i] = d1[i];
-                d1[i] = acc;
-                idx[i] = j;
-            } else if (acc < d2[i]) {
-                d2[i] = acc;
-            }
-        }
-    }
-}
-
-// zero-mean + unit-norm each descriptor so that a dot product == NCC
-std::vector<float> normalize_for_ncc(const float* d, int n) {
-    std::vector<float> out(static_cast<size_t>(n) * SIFT_DIM);
-    for (int i = 0; i < n; ++i) {
-        const float* s = d + static_cast<size_t>(i) * SIFT_DIM;
-        float* o = &out[static_cast<size_t>(i) * SIFT_DIM];
-        double mean = 0.0;
-        for (int k = 0; k < SIFT_DIM; ++k) mean += s[k];
-        mean /= SIFT_DIM;
-        double norm = 0.0;
-        for (int k = 0; k < SIFT_DIM; ++k) {
-            o[k] = static_cast<float>(s[k] - mean);
-            norm += static_cast<double>(o[k]) * o[k];
-        }
-        norm = std::sqrt(norm);
-        if (norm < 1e-12) norm = 1.0;
-        for (int k = 0; k < SIFT_DIM; ++k) o[k] = static_cast<float>(o[k] / norm);
-    }
-    return out;
+    for (int i = 0; i < DIM; ++i) out[i] = static_cast<float>(d[i]);
 }
 
 } // namespace
@@ -485,32 +402,19 @@ EXPORT int detect_corners(
 }
 
 /**
- * Compute 128-D SIFT descriptors at pre-detected (Harris / Shi-Tomasi) keypoints.
+ * 128-D SIFT descriptors at given keypoints (e.g. from detect_corners).
+ * Pipeline: grayscale -> Gaussian blur (sigma) -> gradients -> per keypoint:
+ *           dominant orientation -> rotated 4x4x8 histogram -> normalize/clip.
+ * Harris is single-scale, so all keypoints use the same descriptor scale `sigma`.
  *
- * Pipeline: grayscale -> Gaussian smoothing (sigma) -> gradient maps ->
- *           dominant orientation per keypoint -> 4x4x8 rotated histogram -> normalize/clip.
- * Harris is single-scale, so every keypoint uses the same descriptor scale `sigma`.
- *
- * @param kp_x, kp_y   Keypoint coordinates (as returned by detect_corners)
- * @param n_kp         Number of keypoints
- * @param sigma        Descriptor scale (typ. 1.6 - 3.0)
- * @param out_desc     Output buffer of n_kp * 128 floats (row-major)
- * @param out_orient   Optional output buffer of n_kp doubles (orientation, radians); may be nullptr
- * @param out_time_ms  Output pointer for execution time in milliseconds
- * @return             Number of descriptors written (== n_kp), 0 on invalid input
+ * @param out_desc    n_kp * 128 floats
+ * @param out_orient  n_kp doubles (orientation in radians) or nullptr
+ * @return            n_kp (0 on invalid input)
  */
 EXPORT int compute_sift_descriptors(
-    const uint8_t* img_data,
-    int height,
-    int width,
-    int channels,
-    const int* kp_x,
-    const int* kp_y,
-    int n_kp,
-    double sigma,
-    float* out_desc,
-    double* out_orient,
-    double* out_time_ms
+    const uint8_t* img_data, int height, int width, int channels,
+    const int* kp_x, const int* kp_y, int n_kp, double sigma,
+    float* out_desc, double* out_orient, double* out_time_ms
 ) {
     if (!img_data || !kp_x || !kp_y || !out_desc || height < 3 || width < 3 ||
         (channels != 1 && channels != 3) || n_kp <= 0) {
@@ -521,11 +425,8 @@ EXPORT int compute_sift_descriptors(
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    std::vector<double> gray, smooth, temp(static_cast<size_t>(height) * width);
+    std::vector<double> gray, smooth(static_cast<size_t>(height) * width), temp(smooth.size());
     to_gray(img_data, height, width, channels, gray);
-    smooth.resize(gray.size());
-
-    // pre-smooth at the descriptor scale
     int ksize = 2 * static_cast<int>(std::ceil(3.0 * sigma)) + 1;
     gaussian_blur_2d(gray, smooth, temp, height, width, make_gaussian_kernel_1d(ksize, sigma));
 
@@ -537,7 +438,7 @@ EXPORT int compute_sift_descriptors(
         int y = clamp_idx(kp_y[i], height);
         double theta = dominant_orientation(mag, ang, height, width, x, y, sigma);
         sift_descriptor(mag, ang, height, width, x, y, sigma, theta,
-                        out_desc + static_cast<size_t>(i) * SIFT_DIM);
+                        out_desc + static_cast<size_t>(i) * DIM);
         if (out_orient) out_orient[i] = theta;
     }
 
@@ -547,61 +448,72 @@ EXPORT int compute_sift_descriptors(
 }
 
 /**
- * Match two sets of 128-D descriptors.
+ * Match descriptor set 1 -> set 2 (nearest neighbour + Lowe ratio test).
+ *   method 0: SSD  = sum (a - b)^2            (smaller is better)
+ *   method 1: NCC  = zero-mean normalized dot (larger is better, in [-1, 1])
  *
- * @param method       0 = SSD (minimise), 1 = normalized cross-correlation (maximise)
- * @param ratio        Lowe ratio-test threshold (e.g. 0.8). Use >= 1.0 to disable.
- * @param cross_check  1 = keep only mutual best matches
- * @param out_i/out_j  Indices into set 1 / set 2 for every accepted match
- * @param out_score    SSD value (method 0) or NCC value in [-1, 1] (method 1)
- * @param out_time_ms  Execution time in milliseconds
- * @return             Number of matches written
+ * @param ratio      best/second-best ratio threshold (e.g. 0.8); >= 1 disables the test
+ * @param out_i/j    matched indices into set 1 / set 2 (buffers of size n1)
+ * @param out_score  SSD or NCC value of each match
+ * @return           number of matches
  */
 EXPORT int match_descriptors(
-    const float* desc1,
-    int n1,
-    const float* desc2,
-    int n2,
-    int method,
-    double ratio,
-    int cross_check,
-    int max_matches,
-    int* out_i,
-    int* out_j,
-    double* out_score,
-    double* out_time_ms
+    const float* desc1, int n1, const float* desc2, int n2,
+    int method, double ratio,
+    int* out_i, int* out_j, double* out_score, double* out_time_ms
 ) {
-    if (!desc1 || !desc2 || n1 <= 0 || n2 <= 0 || max_matches <= 0) {
+    if (!desc1 || !desc2 || n1 <= 0 || n2 <= 0) {
         if (out_time_ms) *out_time_ms = 0.0;
         return 0;
     }
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    std::vector<float> A, B;
-    if (method == 1) {
-        A = normalize_for_ncc(desc1, n1);
-        B = normalize_for_ncc(desc2, n2);
-    } else {
-        A.assign(desc1, desc1 + static_cast<size_t>(n1) * SIFT_DIM);
-        B.assign(desc2, desc2 + static_cast<size_t>(n2) * SIFT_DIM);
-    }
+    // NCC = dot product after removing the mean and scaling to unit length
+    auto prepare = [&](const float* d, int n) {
+        std::vector<float> o(d, d + static_cast<size_t>(n) * DIM);
+        if (method == 1) {
+            for (int i = 0; i < n; ++i) {
+                float* p = &o[static_cast<size_t>(i) * DIM];
+                double mean = 0.0, norm = 0.0;
+                for (int k = 0; k < DIM; ++k) mean += p[k];
+                mean /= DIM;
+                for (int k = 0; k < DIM; ++k) { p[k] -= static_cast<float>(mean); norm += double(p[k]) * p[k]; }
+                norm = std::sqrt(norm);
+                if (norm < 1e-12) norm = 1.0;
+                for (int k = 0; k < DIM; ++k) p[k] = static_cast<float>(p[k] / norm);
+            }
+        }
+        return o;
+    };
+    std::vector<float> A = prepare(desc1, n1), B = prepare(desc2, n2);
 
-    std::vector<int> fwd, bwd;
-    std::vector<double> f1, f2, b1, b2;
-    nearest_neighbours(A, n1, B, n2, method, fwd, f1, f2);
-    if (cross_check) nearest_neighbours(B, n2, A, n1, method, bwd, b1, b2);
-
-    // SSD is a squared distance, so square the ratio; NCC uses (1 - ncc) directly.
+    // SSD ratio test is on squared distances; NCC is turned into a distance (1 - NCC)
     double r = (method == 0) ? ratio * ratio : ratio;
+    const double INF = std::numeric_limits<double>::infinity();
     int count = 0;
-    for (int i = 0; i < n1 && count < max_matches; ++i) {
-        int j = fwd[i];
-        if (j < 0) continue;
-        if (f2[i] < std::numeric_limits<double>::infinity() && f1[i] > r * f2[i]) continue;
-        if (cross_check && bwd[j] != i) continue;
+
+    for (int i = 0; i < n1; ++i) {
+        const float* a = &A[static_cast<size_t>(i) * DIM];
+        double best = INF, second = INF;
+        int best_j = -1;
+
+        for (int j = 0; j < n2; ++j) {
+            const float* b = &B[static_cast<size_t>(j) * DIM];
+            double acc = 0.0;
+            if (method == 0) {
+                for (int k = 0; k < DIM; ++k) { double d = double(a[k]) - b[k]; acc += d * d; }
+            } else {
+                for (int k = 0; k < DIM; ++k) acc += double(a[k]) * b[k];
+                acc = 1.0 - acc;
+            }
+            if (acc < best)        { second = best; best = acc; best_j = j; }
+            else if (acc < second) { second = acc; }
+        }
+
+        if (best_j < 0 || best > r * second) continue;   // ambiguous match -> reject
         out_i[count] = i;
-        out_j[count] = j;
-        out_score[count] = (method == 0) ? f1[i] : 1.0 - f1[i];
+        out_j[count] = best_j;
+        out_score[count] = (method == 0) ? best : 1.0 - best;
         ++count;
     }
 
