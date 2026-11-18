@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #ifdef _WIN32
@@ -80,6 +81,219 @@ void gaussian_blur_2d(
             dst[row_offset + c] = acc;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// SIFT descriptor helpers (applied on top of already-detected Harris keypoints)
+// ---------------------------------------------------------------------------
+constexpr double PI_D = 3.14159265358979323846;
+constexpr int SIFT_D = 4;                       // 4x4 spatial grid
+constexpr int SIFT_NB = 8;                      // 8 orientation bins per cell
+constexpr int SIFT_DIM = SIFT_D * SIFT_D * SIFT_NB;  // 128
+constexpr int ORI_BINS = 36;
+
+// RGB -> luminance (or plain copy for grayscale), scaled to [0, 1]
+void to_gray(const uint8_t* img, int h, int w, int ch, std::vector<double>& g) {
+    g.assign(static_cast<size_t>(h) * w, 0.0);
+    for (size_t i = 0; i < g.size(); ++i) {
+        if (ch == 1) {
+            g[i] = img[i] / 255.0;
+        } else {
+            g[i] = (0.299 * img[i * 3] + 0.587 * img[i * 3 + 1] + 0.114 * img[i * 3 + 2]) / 255.0;
+        }
+    }
+}
+
+// Central-difference gradient magnitude and orientation ([0, 2*pi)) for every pixel
+void gradient_maps(const std::vector<double>& g, int h, int w,
+                   std::vector<double>& mag, std::vector<double>& ang) {
+    mag.assign(g.size(), 0.0);
+    ang.assign(g.size(), 0.0);
+    for (int r = 0; r < h; ++r) {
+        for (int c = 0; c < w; ++c) {
+            double dx = 0.5 * (g[static_cast<size_t>(r) * w + clamp_idx(c + 1, w)] -
+                               g[static_cast<size_t>(r) * w + clamp_idx(c - 1, w)]);
+            double dy = 0.5 * (g[static_cast<size_t>(clamp_idx(r + 1, h)) * w + c] -
+                               g[static_cast<size_t>(clamp_idx(r - 1, h)) * w + c]);
+            size_t idx = static_cast<size_t>(r) * w + c;
+            mag[idx] = std::sqrt(dx * dx + dy * dy);
+            double a = std::atan2(dy, dx);
+            if (a < 0) a += 2.0 * PI_D;
+            ang[idx] = a;
+        }
+    }
+}
+
+// Dominant gradient orientation around (x, y): 36-bin Gaussian-weighted histogram,
+// smoothed, peak refined by parabolic interpolation. Returns angle in [0, 2*pi).
+double dominant_orientation(const std::vector<double>& mag, const std::vector<double>& ang,
+                            int h, int w, int x, int y, double sigma) {
+    double s = 1.5 * sigma;
+    int rad = static_cast<int>(std::round(3.0 * s));
+    double inv2s2 = 1.0 / (2.0 * s * s);
+    double hist[ORI_BINS] = {0};
+
+    for (int dy = -rad; dy <= rad; ++dy) {
+        int r = y + dy;
+        if (r < 1 || r >= h - 1) continue;
+        for (int dx = -rad; dx <= rad; ++dx) {
+            int c = x + dx;
+            if (c < 1 || c >= w - 1) continue;
+            size_t idx = static_cast<size_t>(r) * w + c;
+            double wgt = std::exp(-(dx * dx + dy * dy) * inv2s2) * mag[idx];
+            int bin = static_cast<int>(std::floor(ang[idx] * ORI_BINS / (2.0 * PI_D) + 0.5)) % ORI_BINS;
+            hist[bin] += wgt;
+        }
+    }
+
+    // circular smoothing
+    for (int it = 0; it < 6; ++it) {
+        double tmp[ORI_BINS];
+        for (int i = 0; i < ORI_BINS; ++i) {
+            tmp[i] = (hist[(i + ORI_BINS - 1) % ORI_BINS] + hist[i] + hist[(i + 1) % ORI_BINS]) / 3.0;
+        }
+        std::copy(tmp, tmp + ORI_BINS, hist);
+    }
+
+    int best = 0;
+    for (int i = 1; i < ORI_BINS; ++i) if (hist[i] > hist[best]) best = i;
+
+    double l = hist[(best + ORI_BINS - 1) % ORI_BINS];
+    double m = hist[best];
+    double rr = hist[(best + 1) % ORI_BINS];
+    double denom = l - 2.0 * m + rr;
+    double offset = (std::fabs(denom) > 1e-12) ? 0.5 * (l - rr) / denom : 0.0;
+
+    double theta = (best + offset) * 2.0 * PI_D / ORI_BINS;
+    if (theta < 0) theta += 2.0 * PI_D;
+    if (theta >= 2.0 * PI_D) theta -= 2.0 * PI_D;
+    return theta;
+}
+
+// 128-D SIFT descriptor (4x4 cells x 8 bins, trilinear interpolation, rotated to theta)
+void sift_descriptor(const std::vector<double>& mag, const std::vector<double>& ang,
+                     int h, int w, int x, int y, double sigma, double theta, float* out) {
+    double hist_w = 3.0 * sigma;  // width of one spatial cell in pixels
+    int rad = static_cast<int>(std::round(hist_w * std::sqrt(2.0) * (SIFT_D + 1) * 0.5));
+    double cos_t = std::cos(theta), sin_t = std::sin(theta);
+    double hist[SIFT_D][SIFT_D][SIFT_NB] = {};
+
+    for (int dy = -rad; dy <= rad; ++dy) {
+        int r = y + dy;
+        if (r < 1 || r >= h - 1) continue;
+        for (int dx = -rad; dx <= rad; ++dx) {
+            int c = x + dx;
+            if (c < 1 || c >= w - 1) continue;
+
+            // rotate the sample into the keypoint's canonical frame, in cell units
+            double cr = (cos_t * dx + sin_t * dy) / hist_w;
+            double rr = (-sin_t * dx + cos_t * dy) / hist_w;
+            double rbin = rr + SIFT_D / 2.0 - 0.5;
+            double cbin = cr + SIFT_D / 2.0 - 0.5;
+            if (rbin <= -1.0 || rbin >= SIFT_D || cbin <= -1.0 || cbin >= SIFT_D) continue;
+
+            size_t idx = static_cast<size_t>(r) * w + c;
+            double a = ang[idx] - theta;
+            while (a < 0) a += 2.0 * PI_D;
+            while (a >= 2.0 * PI_D) a -= 2.0 * PI_D;
+            double obin = a * SIFT_NB / (2.0 * PI_D);
+
+            double wgt = std::exp(-(rr * rr + cr * cr) / (0.5 * SIFT_D * SIFT_D)) * mag[idx];
+
+            int r0 = static_cast<int>(std::floor(rbin));
+            int c0 = static_cast<int>(std::floor(cbin));
+            int o0 = static_cast<int>(std::floor(obin));
+            double fr = rbin - r0, fc = cbin - c0, fo = obin - o0;
+
+            for (int i = 0; i < 2; ++i) {
+                int ri = r0 + i;
+                if (ri < 0 || ri >= SIFT_D) continue;
+                double wr = wgt * (i ? fr : 1.0 - fr);
+                for (int j = 0; j < 2; ++j) {
+                    int ci = c0 + j;
+                    if (ci < 0 || ci >= SIFT_D) continue;
+                    double wc = wr * (j ? fc : 1.0 - fc);
+                    for (int k = 0; k < 2; ++k) {
+                        int oi = (o0 + k) % SIFT_NB;
+                        hist[ri][ci][oi] += wc * (k ? fo : 1.0 - fo);
+                    }
+                }
+            }
+        }
+    }
+
+    // flatten -> normalize -> clip at 0.2 -> renormalize (illumination invariance)
+    double v[SIFT_DIM];
+    int n = 0;
+    for (int i = 0; i < SIFT_D; ++i)
+        for (int j = 0; j < SIFT_D; ++j)
+            for (int k = 0; k < SIFT_NB; ++k) v[n++] = hist[i][j][k];
+
+    for (int pass = 0; pass < 2; ++pass) {
+        double norm = 0.0;
+        for (int i = 0; i < SIFT_DIM; ++i) norm += v[i] * v[i];
+        norm = std::sqrt(norm);
+        if (norm < 1e-12) norm = 1.0;
+        for (int i = 0; i < SIFT_DIM; ++i) {
+            v[i] /= norm;
+            if (pass == 0 && v[i] > 0.2) v[i] = 0.2;
+        }
+    }
+    for (int i = 0; i < SIFT_DIM; ++i) out[i] = static_cast<float>(v[i]);
+}
+
+// For each row of A, find nearest row in B (and second-nearest distance).
+// method 0: dist = SSD;  method 1: dist = 1 - NCC (A, B must be zero-mean & unit-norm).
+void nearest_neighbours(const std::vector<float>& A, int na, const std::vector<float>& B, int nb,
+                        int method, std::vector<int>& idx, std::vector<double>& d1,
+                        std::vector<double>& d2) {
+    idx.assign(na, -1);
+    d1.assign(na, std::numeric_limits<double>::infinity());
+    d2.assign(na, std::numeric_limits<double>::infinity());
+    for (int i = 0; i < na; ++i) {
+        const float* a = &A[static_cast<size_t>(i) * SIFT_DIM];
+        for (int j = 0; j < nb; ++j) {
+            const float* b = &B[static_cast<size_t>(j) * SIFT_DIM];
+            double acc = 0.0;
+            if (method == 0) {
+                for (int k = 0; k < SIFT_DIM; ++k) {
+                    double d = static_cast<double>(a[k]) - b[k];
+                    acc += d * d;
+                }
+            } else {
+                for (int k = 0; k < SIFT_DIM; ++k) acc += static_cast<double>(a[k]) * b[k];
+                acc = 1.0 - acc;
+            }
+            if (acc < d1[i]) {
+                d2[i] = d1[i];
+                d1[i] = acc;
+                idx[i] = j;
+            } else if (acc < d2[i]) {
+                d2[i] = acc;
+            }
+        }
+    }
+}
+
+// zero-mean + unit-norm each descriptor so that a dot product == NCC
+std::vector<float> normalize_for_ncc(const float* d, int n) {
+    std::vector<float> out(static_cast<size_t>(n) * SIFT_DIM);
+    for (int i = 0; i < n; ++i) {
+        const float* s = d + static_cast<size_t>(i) * SIFT_DIM;
+        float* o = &out[static_cast<size_t>(i) * SIFT_DIM];
+        double mean = 0.0;
+        for (int k = 0; k < SIFT_DIM; ++k) mean += s[k];
+        mean /= SIFT_DIM;
+        double norm = 0.0;
+        for (int k = 0; k < SIFT_DIM; ++k) {
+            o[k] = static_cast<float>(s[k] - mean);
+            norm += static_cast<double>(o[k]) * o[k];
+        }
+        norm = std::sqrt(norm);
+        if (norm < 1e-12) norm = 1.0;
+        for (int k = 0; k < SIFT_DIM; ++k) o[k] = static_cast<float>(o[k] / norm);
+    }
+    return out;
 }
 
 } // namespace
@@ -267,5 +481,131 @@ EXPORT int detect_corners(
         out_scores[i] = corners[i].score;
     }
 
+    return count;
+}
+
+/**
+ * Compute 128-D SIFT descriptors at pre-detected (Harris / Shi-Tomasi) keypoints.
+ *
+ * Pipeline: grayscale -> Gaussian smoothing (sigma) -> gradient maps ->
+ *           dominant orientation per keypoint -> 4x4x8 rotated histogram -> normalize/clip.
+ * Harris is single-scale, so every keypoint uses the same descriptor scale `sigma`.
+ *
+ * @param kp_x, kp_y   Keypoint coordinates (as returned by detect_corners)
+ * @param n_kp         Number of keypoints
+ * @param sigma        Descriptor scale (typ. 1.6 - 3.0)
+ * @param out_desc     Output buffer of n_kp * 128 floats (row-major)
+ * @param out_orient   Optional output buffer of n_kp doubles (orientation, radians); may be nullptr
+ * @param out_time_ms  Output pointer for execution time in milliseconds
+ * @return             Number of descriptors written (== n_kp), 0 on invalid input
+ */
+EXPORT int compute_sift_descriptors(
+    const uint8_t* img_data,
+    int height,
+    int width,
+    int channels,
+    const int* kp_x,
+    const int* kp_y,
+    int n_kp,
+    double sigma,
+    float* out_desc,
+    double* out_orient,
+    double* out_time_ms
+) {
+    if (!img_data || !kp_x || !kp_y || !out_desc || height < 3 || width < 3 ||
+        (channels != 1 && channels != 3) || n_kp <= 0) {
+        if (out_time_ms) *out_time_ms = 0.0;
+        return 0;
+    }
+    if (sigma < 0.5) sigma = 0.5;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    std::vector<double> gray, smooth, temp(static_cast<size_t>(height) * width);
+    to_gray(img_data, height, width, channels, gray);
+    smooth.resize(gray.size());
+
+    // pre-smooth at the descriptor scale
+    int ksize = 2 * static_cast<int>(std::ceil(3.0 * sigma)) + 1;
+    gaussian_blur_2d(gray, smooth, temp, height, width, make_gaussian_kernel_1d(ksize, sigma));
+
+    std::vector<double> mag, ang;
+    gradient_maps(smooth, height, width, mag, ang);
+
+    for (int i = 0; i < n_kp; ++i) {
+        int x = clamp_idx(kp_x[i], width);
+        int y = clamp_idx(kp_y[i], height);
+        double theta = dominant_orientation(mag, ang, height, width, x, y, sigma);
+        sift_descriptor(mag, ang, height, width, x, y, sigma, theta,
+                        out_desc + static_cast<size_t>(i) * SIFT_DIM);
+        if (out_orient) out_orient[i] = theta;
+    }
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    if (out_time_ms) *out_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    return n_kp;
+}
+
+/**
+ * Match two sets of 128-D descriptors.
+ *
+ * @param method       0 = SSD (minimise), 1 = normalized cross-correlation (maximise)
+ * @param ratio        Lowe ratio-test threshold (e.g. 0.8). Use >= 1.0 to disable.
+ * @param cross_check  1 = keep only mutual best matches
+ * @param out_i/out_j  Indices into set 1 / set 2 for every accepted match
+ * @param out_score    SSD value (method 0) or NCC value in [-1, 1] (method 1)
+ * @param out_time_ms  Execution time in milliseconds
+ * @return             Number of matches written
+ */
+EXPORT int match_descriptors(
+    const float* desc1,
+    int n1,
+    const float* desc2,
+    int n2,
+    int method,
+    double ratio,
+    int cross_check,
+    int max_matches,
+    int* out_i,
+    int* out_j,
+    double* out_score,
+    double* out_time_ms
+) {
+    if (!desc1 || !desc2 || n1 <= 0 || n2 <= 0 || max_matches <= 0) {
+        if (out_time_ms) *out_time_ms = 0.0;
+        return 0;
+    }
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    std::vector<float> A, B;
+    if (method == 1) {
+        A = normalize_for_ncc(desc1, n1);
+        B = normalize_for_ncc(desc2, n2);
+    } else {
+        A.assign(desc1, desc1 + static_cast<size_t>(n1) * SIFT_DIM);
+        B.assign(desc2, desc2 + static_cast<size_t>(n2) * SIFT_DIM);
+    }
+
+    std::vector<int> fwd, bwd;
+    std::vector<double> f1, f2, b1, b2;
+    nearest_neighbours(A, n1, B, n2, method, fwd, f1, f2);
+    if (cross_check) nearest_neighbours(B, n2, A, n1, method, bwd, b1, b2);
+
+    // SSD is a squared distance, so square the ratio; NCC uses (1 - ncc) directly.
+    double r = (method == 0) ? ratio * ratio : ratio;
+    int count = 0;
+    for (int i = 0; i < n1 && count < max_matches; ++i) {
+        int j = fwd[i];
+        if (j < 0) continue;
+        if (f2[i] < std::numeric_limits<double>::infinity() && f1[i] > r * f2[i]) continue;
+        if (cross_check && bwd[j] != i) continue;
+        out_i[count] = i;
+        out_j[count] = j;
+        out_score[count] = (method == 0) ? f1[i] : 1.0 - f1[i];
+        ++count;
+    }
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    if (out_time_ms) *out_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     return count;
 }
