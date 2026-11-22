@@ -23,6 +23,7 @@ dist/
 *.o
 *.obj
 *.lib
+*.dll
 
 # IDE and OS files
 .idea/
