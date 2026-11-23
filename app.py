@@ -7,7 +7,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Harris & λ- Corner Detector", layout="wide")
+st.set_page_config(page_title="Harris / Scale-Invariant SIFT Pipeline", layout="wide")
+
+_DP = ctypes.POINTER(ctypes.c_double)
+_FP = ctypes.POINTER(ctypes.c_float)
+_IP = ctypes.POINTER(ctypes.c_int)
+_UP = ctypes.POINTER(ctypes.c_uint8)
 
 
 @st.cache_resource
@@ -26,7 +31,7 @@ def load_engine():
 
     lib = ctypes.CDLL(str(lib_path))
     lib.detect_corners.argtypes = [
-        ctypes.POINTER(ctypes.c_uint8),   # img_data
+        _UP,                              # img_data
         ctypes.c_int,                     # height
         ctypes.c_int,                     # width
         ctypes.c_int,                     # channels
@@ -37,44 +42,61 @@ def load_engine():
         ctypes.c_double,                  # threshold_ratio
         ctypes.c_int,                     # nms_window
         ctypes.c_int,                     # max_corners
-        ctypes.POINTER(ctypes.c_int),     # out_x
-        ctypes.POINTER(ctypes.c_int),     # out_y
-        ctypes.POINTER(ctypes.c_double),  # out_scores
-        ctypes.POINTER(ctypes.c_double),  # out_response
-        ctypes.POINTER(ctypes.c_double),  # out_time_ms
+        _IP,                              # out_x
+        _IP,                              # out_y
+        _DP,                              # out_scores
+        _DP,                              # out_response
+        _DP,                              # out_time_ms
     ]
     lib.detect_corners.restype = ctypes.c_int
 
-    # SIFT + matching (only present if engine was rebuilt from the latest engine.cpp)
-    if hasattr(lib, "compute_sift_descriptors") and hasattr(lib, "match_descriptors"):
-        lib.compute_sift_descriptors.argtypes = [
-            ctypes.POINTER(ctypes.c_uint8),   # img_data
-            ctypes.c_int,                     # height
-            ctypes.c_int,                     # width
-            ctypes.c_int,                     # channels
-            ctypes.POINTER(ctypes.c_int),     # kp_x
-            ctypes.POINTER(ctypes.c_int),     # kp_y
-            ctypes.c_int,                     # n_kp
-            ctypes.c_double,                  # sigma
-            ctypes.POINTER(ctypes.c_float),   # out_desc (n_kp * 128)
-            ctypes.POINTER(ctypes.c_double),  # out_orient
-            ctypes.POINTER(ctypes.c_double),  # out_time_ms
+    # Scale-space SIFT + matching (only present if engine was rebuilt from the latest engine.cpp)
+    if hasattr(lib, "detect_and_describe_sift") and hasattr(lib, "match_descriptors"):
+        lib.detect_and_describe_sift.argtypes = [
+            _UP,                          # img_data
+            ctypes.c_int,                 # height
+            ctypes.c_int,                 # width
+            ctypes.c_int,                 # channels
+            ctypes.c_int,                 # n_layers (S)
+            ctypes.c_double,              # sigma0
+            ctypes.c_double,              # contrast_thr
+            ctypes.c_double,              # edge_thr (r)
+            ctypes.c_int,                 # upsample
+            ctypes.c_int,                 # max_kp
+            _DP,                          # out_x (original-image pixels)
+            _DP,                          # out_y
+            _DP,                          # out_sigma (characteristic scale)
+            _DP,                          # out_orient
+            _DP,                          # out_response
+            _FP,                          # out_desc (max_kp * 128)
+            _DP,                          # out_time_ms
         ]
-        lib.compute_sift_descriptors.restype = ctypes.c_int
+        lib.detect_and_describe_sift.restype = ctypes.c_int
+
         lib.match_descriptors.argtypes = [
-            ctypes.POINTER(ctypes.c_float),   # desc1
-            ctypes.c_int,                     # n1
-            ctypes.POINTER(ctypes.c_float),   # desc2
-            ctypes.c_int,                     # n2
-            ctypes.c_int,                     # method (0=SSD, 1=NCC)
-            ctypes.c_double,                  # ratio
-            ctypes.POINTER(ctypes.c_int),     # out_i
-            ctypes.POINTER(ctypes.c_int),     # out_j
-            ctypes.POINTER(ctypes.c_double),  # out_score
-            ctypes.POINTER(ctypes.c_double),  # out_time_ms
+            _FP,                          # desc1
+            ctypes.c_int,                 # n1
+            _FP,                          # desc2
+            ctypes.c_int,                 # n2
+            ctypes.c_int,                 # method (0=SSD, 1=NCC)
+            ctypes.c_double,              # ratio
+            _IP,                          # out_i
+            _IP,                          # out_j
+            _DP,                          # out_score
+            _DP,                          # out_time_ms
         ]
         lib.match_descriptors.restype = ctypes.c_int
     return lib, str(lib_path)
+
+
+def _as_uint8(img: np.ndarray):
+    img_c = np.ascontiguousarray(img, dtype=np.uint8)
+    if img_c.ndim == 2:
+        h, w = img_c.shape
+        channels = 1
+    else:
+        h, w, channels = img_c.shape
+    return img_c, h, w, channels
 
 
 @st.cache_data(show_spinner=False)
@@ -91,12 +113,7 @@ def run_detector(
     need_response: bool = True,
     max_corners: int = 50000,
 ):
-    img_c = np.ascontiguousarray(_img, dtype=np.uint8)
-    if img_c.ndim == 2:
-        h, w = img_c.shape
-        channels = 1
-    else:
-        h, w, channels = img_c.shape
+    img_c, h, w, channels = _as_uint8(_img)
 
     out_x = np.empty(max_corners, dtype=np.int32)
     out_y = np.empty(max_corners, dtype=np.int32)
@@ -104,13 +121,11 @@ def run_detector(
     out_response = np.empty((h, w), dtype=np.float64) if need_response else None
     time_ms = ctypes.c_double(0.0)
     response_ptr = (
-        out_response.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-        if out_response is not None
-        else ctypes.POINTER(ctypes.c_double)()
+        out_response.ctypes.data_as(_DP) if out_response is not None else _DP()
     )
 
     count = _lib.detect_corners(
-        img_c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        img_c.ctypes.data_as(_UP),
         h,
         w,
         channels,
@@ -121,57 +136,72 @@ def run_detector(
         threshold_ratio,
         nms_window,
         max_corners,
-        out_x.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-        out_y.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-        out_scores.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        out_x.ctypes.data_as(_IP),
+        out_y.ctypes.data_as(_IP),
+        out_scores.ctypes.data_as(_DP),
         response_ptr,
         ctypes.byref(time_ms),
     )
 
-    return out_x[:count], out_y[:count], out_scores[:count], out_response, time_ms.value
+    return out_x[:count].copy(), out_y[:count].copy(), out_scores[:count].copy(), out_response, time_ms.value
 
 
 @st.cache_data(show_spinner=False)
-def run_sift(
+def run_dog_sift(
     _lib,
     cache_key,
     _img: np.ndarray,
-    _xs: np.ndarray,
-    _ys: np.ndarray,
-    sigma: float,
+    n_layers: int,
+    sigma0: float,
+    contrast_thr: float,
+    edge_thr: float,
+    upsample: bool,
+    max_kp: int,
 ):
-    """Compute 128-D SIFT descriptors at the given (Harris / Shi-Tomasi) keypoints."""
-    img_c = np.ascontiguousarray(_img, dtype=np.uint8)
-    if img_c.ndim == 2:
-        h, w = img_c.shape
-        channels = 1
-    else:
-        h, w, channels = img_c.shape
+    """Full scale-space SIFT: Gaussian/DoG pyramid -> 3-D extrema -> orientation -> descriptor.
 
-    n = len(_xs)
-    if n == 0:
-        return np.zeros((0, 128), np.float32), np.zeros(0), 0.0
+    Returns (xs, ys, sigmas, orientations, responses, descriptors, time_ms); positions and
+    sigmas are in original-image pixels, every keypoint carries its own characteristic scale.
+    """
+    img_c, h, w, channels = _as_uint8(_img)
 
-    kx = np.ascontiguousarray(_xs, dtype=np.int32)
-    ky = np.ascontiguousarray(_ys, dtype=np.int32)
-    desc = np.empty((n, 128), dtype=np.float32)
-    orient = np.empty(n, dtype=np.float64)
+    xs = np.empty(max_kp, dtype=np.float64)
+    ys = np.empty(max_kp, dtype=np.float64)
+    sigmas = np.empty(max_kp, dtype=np.float64)
+    orient = np.empty(max_kp, dtype=np.float64)
+    resp = np.empty(max_kp, dtype=np.float64)
+    desc = np.zeros((max_kp, 128), dtype=np.float32)
     time_ms = ctypes.c_double(0.0)
 
-    _lib.compute_sift_descriptors(
-        img_c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+    n = _lib.detect_and_describe_sift(
+        img_c.ctypes.data_as(_UP),
         h,
         w,
         channels,
-        kx.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-        ky.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-        n,
-        sigma,
-        desc.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        orient.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        int(n_layers),
+        float(sigma0),
+        float(contrast_thr),
+        float(edge_thr),
+        int(upsample),
+        int(max_kp),
+        xs.ctypes.data_as(_DP),
+        ys.ctypes.data_as(_DP),
+        sigmas.ctypes.data_as(_DP),
+        orient.ctypes.data_as(_DP),
+        resp.ctypes.data_as(_DP),
+        desc.ctypes.data_as(_FP),
         ctypes.byref(time_ms),
     )
-    return desc, orient, time_ms.value
+    n = max(int(n), 0)
+    return (
+        xs[:n].copy(),
+        ys[:n].copy(),
+        sigmas[:n].copy(),
+        orient[:n].copy(),
+        resp[:n].copy(),
+        desc[:n].copy(),
+        time_ms.value,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -197,15 +227,15 @@ def run_matcher(
     time_ms = ctypes.c_double(0.0)
 
     count = _lib.match_descriptors(
-        d1.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        d1.ctypes.data_as(_FP),
         len(d1),
-        d2.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        d2.ctypes.data_as(_FP),
         len(d2),
         method,
         ratio,
-        out_i.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-        out_j.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-        out_s.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        out_i.ctypes.data_as(_IP),
+        out_j.ctypes.data_as(_IP),
+        out_s.ctypes.data_as(_DP),
         ctypes.byref(time_ms),
     )
     return out_i[:count], out_j[:count], out_s[:count], time_ms.value
@@ -238,6 +268,52 @@ def draw_corners(img: np.ndarray, xs: np.ndarray, ys: np.ndarray, radius: int):
     )
     for x, y in zip(xs, ys):
         cv2.circle(canvas, (int(x), int(y)), radius, (255, 40, 40), -1)
+    return canvas
+
+
+def draw_sift_keypoints(
+    img: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    sigmas: np.ndarray,
+    orient: np.ndarray,
+    size_mult: float,
+    thickness: int,
+    max_drawn: int,
+):
+    """Draw each keypoint with ITS OWN scale: circle radius = size_mult * sigma.
+
+    Circle colour encodes the scale (viridis over log2 sigma); the red line is the
+    keypoint's dominant orientation.
+    """
+    canvas = (
+        cv2.cvtColor(img, cv2.COLOR_GRAY2RGB) if img.ndim == 2 else img.copy()
+    )
+    n = min(len(xs), max_drawn)
+    if n == 0:
+        return canvas
+
+    log_s = np.log2(np.maximum(sigmas[:n], 1e-6))
+    span = max(float(log_s.max() - log_s.min()), 1e-6)
+    norm = ((log_s - log_s.min()) / span * 255.0).astype(np.uint8).reshape(-1, 1)
+    palette_bgr = cv2.applyColorMap(norm, cv2.COLORMAP_VIRIDIS).reshape(-1, 3)
+    palette = palette_bgr[:, ::-1]                      # canvas is RGB
+    max_rad = int(max(img.shape[0], img.shape[1]))
+
+    # draw large (coarse-scale) keypoints first so small ones stay visible on top
+    for i in np.argsort(-sigmas[:n]):
+        x, y, s, th = float(xs[i]), float(ys[i]), float(sigmas[i]), float(orient[i])
+        rad = int(min(max(2, round(size_mult * s)), max_rad))
+        center = (int(round(x)), int(round(y)))
+        endpoint = (
+            int(round(x + rad * np.cos(th))),
+            int(round(y + rad * np.sin(th))),
+        )
+        color = tuple(int(v) for v in palette[i])
+        cv2.circle(canvas, center, rad, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.circle(canvas, center, rad, color, thickness, cv2.LINE_AA)
+        cv2.line(canvas, center, endpoint, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.line(canvas, center, endpoint, (255, 40, 40), thickness, cv2.LINE_AA)
     return canvas
 
 
@@ -279,8 +355,8 @@ def draw_matches(
         rgb_palette = np.zeros((0, 3), dtype=np.uint8)
     for line_index, m in enumerate(order):
         color = tuple(int(v) for v in rgb_palette[line_index])
-        p1 = (int(xs1[idx1[m]]), int(ys1[idx1[m]]))
-        p2 = (int(xs2[idx2[m]]) + off, int(ys2[idx2[m]]))
+        p1 = (int(round(xs1[idx1[m]])), int(round(ys1[idx1[m]])))
+        p2 = (int(round(xs2[idx2[m]])) + off, int(round(ys2[idx2[m]])))
         cv2.line(canvas, p1, p2, (0, 0, 0), line_thickness + 2, cv2.LINE_AA)
         cv2.line(canvas, p1, p2, color, line_thickness, cv2.LINE_AA)
         cv2.circle(canvas, p1, point_radius + 2, (0, 0, 0), -1, cv2.LINE_AA)
@@ -302,6 +378,19 @@ def build_response_heatmap(response: np.ndarray):
     return cv2.cvtColor(bgr_map, cv2.COLOR_BGR2RGB)
 
 
+def scale_histogram(sigmas: np.ndarray, sigma0: float):
+    """Keypoint count per scale band [sigma0*2^k, sigma0*2^(k+1)) in original pixels."""
+    if len(sigmas) == 0:
+        return pd.DataFrame({"Keypoints": []})
+    k = np.floor(np.log2(np.maximum(sigmas, 1e-6) / sigma0)).astype(int)
+    counts = pd.Series(k).value_counts().sort_index()
+    labels = [
+        f"B{int(i):02d}: σ {sigma0 * 2.0 ** int(i):.1f}–{sigma0 * 2.0 ** (int(i) + 1):.1f} px"
+        for i in counts.index
+    ]
+    return pd.DataFrame({"Keypoints": counts.values}, index=labels)
+
+
 def init_state():
     defaults = {
         "cfg_operator": "Harris (R)",
@@ -311,10 +400,14 @@ def init_state():
         "cfg_threshold_pct": 1.0,
         "cfg_nms_window": 5,
         "cfg_marker_radius": 3,
-        "cfg_sift_sigma": 2.0,
+        "cfg_sift_layers": 3,
+        "cfg_sift_sigma0": 1.6,
+        "cfg_sift_contrast": 0.04,
+        "cfg_sift_edge": 10.0,
+        "cfg_sift_upsample": True,
         "cfg_max_kp": 1500,
         "cfg_ratio": 0.8,
-        "cfg_sift_keypoint_scale": 1.2,
+        "cfg_sift_circle_mult": 6.0,
         "cfg_sift_line_thickness": 2,
         "cfg_sift_max_drawn": 300,
         "cfg_match_line_thickness": 2,
@@ -345,10 +438,11 @@ def sync_widget(widget_key: str, cfg_key: str):
 
 # --- Engine Check ---
 engine, expected_path = load_engine()
-if engine is None or not hasattr(engine, "compute_sift_descriptors"):
-    st.title("Feature Extraction: Harris / Shi-Tomasi → SIFT → Matching")
+if engine is None or not hasattr(engine, "detect_and_describe_sift"):
+    st.title("Feature Extraction: Harris / Shi-Tomasi → Scale-Invariant SIFT → Matching")
     st.error(
-        "Shared library missing or outdated. Compile `engine.cpp`:\n"
+        "Shared library missing or outdated (the scale-space SIFT functions were not found). "
+        "Compile the latest `engine.cpp` next to `app.py`:\n"
         "```bash\n"
         "g++ -O3 -shared -static -o engine.dll engine.cpp          # Windows\n"
         "g++ -O3 -shared -fPIC -o libengine.so engine.cpp          # Linux\n"
@@ -378,7 +472,7 @@ with st.sidebar:
         ["1. Harris / Shi-Tomasi", "2. SIFT", "3. Matching"],
     )
 
-st.title("Feature Extraction: Harris / Shi-Tomasi → SIFT → Matching")
+st.title("Feature Extraction: Harris / Shi-Tomasi → Scale-Invariant SIFT → Matching")
 
 if not uploaded_files:
     st.info("Upload one or more images in the sidebar to start.")
@@ -402,6 +496,21 @@ if not images:
     st.stop()
 
 image_names = list(images.keys())
+
+if len(image_names) >= 2:
+    if "match_a" in st.session_state and st.session_state["match_a"] not in image_names:
+        st.session_state["match_a"] = image_names[0]
+    if (
+        "match_b" in st.session_state
+        and (
+            st.session_state["match_b"] not in image_names
+            or st.session_state["match_b"] == st.session_state.get("match_a")
+        )
+    ):
+        st.session_state["match_b"] = next(
+            (n for n in image_names if n != st.session_state.get("match_a", image_names[0])),
+            image_names[1],
+        )
 
 new_names = [name for name in image_names if name not in st.session_state["known_image_names"]]
 if new_names:
@@ -430,6 +539,40 @@ def get_corner_params():
         st.session_state["cfg_threshold_pct"] / 100.0,
         st.session_state["cfg_nms_window"],
     )
+
+
+def get_sift_params():
+    """(n_layers, sigma0, contrast_thr, edge_thr, upsample) from the session settings."""
+    s = st.session_state
+    return (
+        int(s["cfg_sift_layers"]),
+        round(float(s["cfg_sift_sigma0"]), 2),
+        round(float(s["cfg_sift_contrast"]), 4),
+        round(float(s["cfg_sift_edge"]), 1),
+        bool(s["cfg_sift_upsample"]),
+    )
+
+
+def compute_features(name: str):
+    """Keypoints (x, y, sigma, orientation) + 128-D descriptors for one image."""
+    img = images[name]
+    layers, sigma0, contrast, edge, upsample = get_sift_params()
+    max_kp = st.session_state["cfg_max_kp"]
+    key = (img_tokens[name], "dog", layers, sigma0, contrast, edge, upsample, max_kp)
+    xs, ys, sg, ori, resp, desc, ms = run_dog_sift(
+        engine, key, img, layers, sigma0, contrast, edge, upsample, max_kp
+    )
+    return {
+        "key": key,
+        "xs": xs,
+        "ys": ys,
+        "sigmas": sg,
+        "orient": ori,
+        "desc": desc,
+        "detect_ms": None,
+        "sift_ms": ms,
+        "sigma0": sigma0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -578,22 +721,59 @@ if stage == "1. Harris / Shi-Tomasi":
         )
 
 # ---------------------------------------------------------------------------
-# Stage 2: SIFT Descriptors
+# Stage 2: Scale-invariant SIFT
 # ---------------------------------------------------------------------------
 elif stage == "2. SIFT":
     with st.sidebar:
         st.divider()
         st.header("SIFT Parameters")
         selected_name = st.selectbox("Inspect image", image_names, key="stage2_img")
-        bind_widget("w_sift_sigma", "cfg_sift_sigma")
-        st.slider(
-            "Descriptor scale (σ)",
-            1.0,
-            4.0,
-            step=0.1,
-            key="w_sift_sigma",
+
+        bind_widget("w_sift_layers", "cfg_sift_layers")
+        st.select_slider(
+            "Scales per octave (S)",
+            options=[2, 3, 4, 5],
+            key="w_sift_layers",
             on_change=sync_widget,
-            args=("w_sift_sigma", "cfg_sift_sigma"),
+            args=("w_sift_layers", "cfg_sift_layers"),
+        )
+        bind_widget("w_sift_sigma0", "cfg_sift_sigma0")
+        st.slider(
+            "Base blur σ₀",
+            1.0,
+            2.5,
+            step=0.1,
+            key="w_sift_sigma0",
+            on_change=sync_widget,
+            args=("w_sift_sigma0", "cfg_sift_sigma0"),
+        )
+        bind_widget("w_sift_upsample", "cfg_sift_upsample")
+        st.checkbox(
+            "Double image size first (finds the smallest features)",
+            key="w_sift_upsample",
+            on_change=sync_widget,
+            args=("w_sift_upsample", "cfg_sift_upsample"),
+        )
+        bind_widget("w_sift_contrast", "cfg_sift_contrast")
+        st.slider(
+            "DoG contrast threshold",
+            0.01,
+            0.12,
+            step=0.005,
+            format="%.3f",
+            key="w_sift_contrast",
+            on_change=sync_widget,
+            args=("w_sift_contrast", "cfg_sift_contrast"),
+        )
+        bind_widget("w_sift_edge", "cfg_sift_edge")
+        st.slider(
+            "Edge threshold (r)",
+            4.0,
+            20.0,
+            step=1.0,
+            key="w_sift_edge",
+            on_change=sync_widget,
+            args=("w_sift_edge", "cfg_sift_edge"),
         )
         bind_widget("w_max_kp", "cfg_max_kp")
         st.slider(
@@ -605,15 +785,18 @@ elif stage == "2. SIFT":
             on_change=sync_widget,
             args=("w_max_kp", "cfg_max_kp"),
         )
-        bind_widget("w_sift_keypoint_scale", "cfg_sift_keypoint_scale")
+
+        st.subheader("Display")
+        bind_widget("w_sift_circle_mult", "cfg_sift_circle_mult")
         st.slider(
-            "Keypoint size scale",
-            0.5,
-            3.0,
-            step=0.1,
-            key="w_sift_keypoint_scale",
+            "Circle radius (× σ)",
+            1.0,
+            8.0,
+            step=0.5,
+            key="w_sift_circle_mult",
+            help="6 × σ is the half-width of the descriptor support region (4 cells of 3σ).",
             on_change=sync_widget,
-            args=("w_sift_keypoint_scale", "cfg_sift_keypoint_scale"),
+            args=("w_sift_circle_mult", "cfg_sift_circle_mult"),
         )
         bind_widget("w_sift_line_thickness", "cfg_sift_line_thickness")
         st.slider(
@@ -636,103 +819,64 @@ elif stage == "2. SIFT":
         )
 
     cur_img = images[selected_name]
-    op, method_id, gauss_ksize, sigma, k_eff, threshold_ratio, nms_window = get_corner_params()
-    sift_sigma = st.session_state["cfg_sift_sigma"]
+    feats = compute_features(selected_name)
+    layers, sigma0, contrast, edge, upsample = get_sift_params()
     max_kp = st.session_state["cfg_max_kp"]
-
-    detector_cache_key = (
-        img_tokens[selected_name],
-        method_id,
-        gauss_ksize,
-        round(sigma, 2),
-        round(k_eff, 4),
-        round(threshold_ratio, 4),
-        nms_window,
-    )
-    xs, ys, _, _, corner_ms = run_detector(
-        engine,
-        img_tokens[selected_name],
-        cur_img,
-        method_id,
-        gauss_ksize,
-        sigma,
-        k_eff,
-        threshold_ratio,
-        nms_window,
-        need_response=False,
-    )
-    sift_x, sift_y = xs[:max_kp], ys[:max_kp]
-    sift_cache_key = detector_cache_key + (round(sift_sigma, 2), max_kp)
-    desc, orient, sift_ms = run_sift(
-        engine,
-        sift_cache_key,
-        cur_img,
-        sift_x,
-        sift_y,
-        sift_sigma,
-    )
+    sigmas = feats["sigmas"]
+    n_kp = len(feats["xs"])
+    total_ms = feats["sift_ms"]
     current_sift_row = {
         "Image": selected_name,
-        "Operator": op,
-        "SIFT σ": round(sift_sigma, 2),
+        "S": layers,
+        "σ₀": sigma0,
+        "Contrast": f"{contrast:.3f}",
+        "Edge r": f"{edge:.0f}",
+        "Upsample": "yes" if upsample else "no",
         "Max KP": max_kp,
-        "Keypoints": len(sift_x),
+        "Keypoints": n_kp,
+        "σ min / median / max": (
+            f"{sigmas.min():.2f} / {np.median(sigmas):.2f} / {sigmas.max():.2f}" if n_kp else "—"
+        ),
         "Descriptor size": "128",
-        "Corner time (ms)": round(corner_ms, 3),
-        "SIFT time (ms)": round(sift_ms, 3),
+        "SIFT time (ms)": round(total_ms, 3),
     }
-    sift_compute_sig = (
-        selected_name,
-        op,
-        gauss_ksize,
-        round(sigma, 2),
-        round(k_eff, 4),
-        round(threshold_ratio, 4),
-        nms_window,
-        round(sift_sigma, 2),
-        max_kp,
-    )
+
+    sift_compute_sig = (selected_name,) + tuple(feats["key"])
     if sift_compute_sig != st.session_state["last_sift_compute_sig"]:
         st.session_state["sift_log"].append(current_sift_row.copy())
         st.session_state["last_sift_compute_sig"] = sift_compute_sig
 
-    st.caption(f"SIFT is computed on the {op} keypoints from Stage 1 (strongest first).")
-
-    canvas = (
-        cv2.cvtColor(cur_img, cv2.COLOR_GRAY2RGB)
-        if cur_img.ndim == 2
-        else cur_img.copy()
+    st.caption(
+        "Keypoints come from Difference-of-Gaussian extrema in (x, y, scale). "
+        "Each keypoint has its own characteristic σ, which sets its orientation window "
+        "and descriptor cell width. SIFT time covers pyramid, detection, orientation and descriptors."
     )
-    keypoint_scale = st.session_state["cfg_sift_keypoint_scale"]
-    line_thickness = st.session_state["cfg_sift_line_thickness"]
-    max_drawn = st.session_state["cfg_sift_max_drawn"]
-    rad = max(2, int(round(3 * sift_sigma * 2.5 * keypoint_scale)))
-    for x, y, th in list(zip(sift_x, sift_y, orient))[:max_drawn]:
-        center = (int(x), int(y))
-        endpoint = (
-            int(x + rad * np.cos(th)),
-            int(y + rad * np.sin(th)),
-        )
-        cv2.circle(canvas, center, rad, (0, 0, 0), line_thickness + 2, cv2.LINE_AA)
-        cv2.circle(canvas, center, rad, (0, 255, 120), line_thickness, cv2.LINE_AA)
-        cv2.line(
-            canvas,
-            center,
-            endpoint,
-            (0, 0, 0),
-            line_thickness + 2,
-            cv2.LINE_AA,
-        )
-        cv2.line(
-            canvas,
-            center,
-            endpoint,
-            (255, 40, 40),
-            line_thickness,
-            cv2.LINE_AA,
-        )
-    st.caption(f"Circle = descriptor support region, red line = dominant orientation (first {max_drawn} keypoints).")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Keypoints", n_kp)
+    m2.metric("Smallest σ (px)", f"{sigmas.min():.2f}" if n_kp else "—")
+    m3.metric("Largest σ (px)", f"{sigmas.max():.2f}" if n_kp else "—")
+    m4.metric("SIFT time (ms)", f"{total_ms:.1f}")
+
+    canvas = draw_sift_keypoints(
+        cur_img,
+        feats["xs"],
+        feats["ys"],
+        sigmas,
+        feats["orient"],
+        st.session_state["cfg_sift_circle_mult"],
+        st.session_state["cfg_sift_line_thickness"],
+        st.session_state["cfg_sift_max_drawn"],
+    )
+    st.caption(
+        f"Circle radius = {st.session_state['cfg_sift_circle_mult']:g} × the keypoint's own σ "
+        f"(colour = scale, purple small → yellow large); red line = dominant orientation "
+        f"(first {st.session_state['cfg_sift_max_drawn']} keypoints)."
+    )
     st.image(canvas, width="stretch")
+
+    st.subheader("Keypoints per scale band")
+    st.bar_chart(scale_histogram(sigmas, sigma0))
 
     st.subheader("SIFT computation log")
     visible_sift_rows = [
@@ -814,60 +958,21 @@ else:
             args=("w_match_max_drawn", "cfg_match_max_drawn"),
         )
 
-    op, method_id, gauss_ksize, sigma, k_eff, threshold_ratio, nms_window = get_corner_params()
-    sift_sigma = st.session_state["cfg_sift_sigma"]
-    max_kp = st.session_state["cfg_max_kp"]
     ratio = st.session_state["cfg_ratio"]
+    max_kp = st.session_state["cfg_max_kp"]
+    layers, sigma0, contrast, edge, upsample = get_sift_params()
 
     img_a, img_b = images[name_a], images[name_b]
-    xa, ya, _, _, _ = run_detector(
-        engine,
-        img_tokens[name_a],
-        img_a,
-        method_id,
-        gauss_ksize,
-        sigma,
-        k_eff,
-        threshold_ratio,
-        nms_window,
-        need_response=False,
-    )
-    xb, yb, _, _, _ = run_detector(
-        engine,
-        img_tokens[name_b],
-        img_b,
-        method_id,
-        gauss_ksize,
-        sigma,
-        k_eff,
-        threshold_ratio,
-        nms_window,
-        need_response=False,
-    )
-    sift_xa, sift_ya = xa[:max_kp], ya[:max_kp]
-    sift_xb, sift_yb = xb[:max_kp], yb[:max_kp]
-    sift_cache_base = (
-        method_id,
-        gauss_ksize,
-        round(sigma, 2),
-        round(k_eff, 4),
-        round(threshold_ratio, 4),
-        nms_window,
-        round(sift_sigma, 2),
-        max_kp,
-    )
-    sift_cache_a = (img_tokens[name_a],) + sift_cache_base
-    sift_cache_b = (img_tokens[name_b],) + sift_cache_base
-    desc_a, _, _ = run_sift(engine, sift_cache_a, img_a, sift_xa, sift_ya, sift_sigma)
-    desc_b, _, _ = run_sift(engine, sift_cache_b, img_b, sift_xb, sift_yb, sift_sigma)
+    fa = compute_features(name_a)
+    fb = compute_features(name_b)
 
     out = {
         label: run_matcher(
             engine,
-            sift_cache_a,
-            sift_cache_b,
-            desc_a,
-            desc_b,
+            fa["key"],
+            fb["key"],
+            fa["desc"],
+            fb["desc"],
             mid,
             ratio,
         )
@@ -875,22 +980,33 @@ else:
     }
     current_match_rows = []
     for label in ("SSD", "NCC"):
+        i1, i2, _, t_ms = out[label]
+        if len(i1):
+            scale_ratio = float(np.median(fb["sigmas"][i2] / fa["sigmas"][i1]))
+            scale_txt = f"{scale_ratio:.3f}"
+        else:
+            scale_txt = "—"
         row = {
             "Image A": name_a,
             "Image B": name_b,
-            "Operator": op,
             "Method": label,
-            "SIFT σ": round(sift_sigma, 2),
+            "S": layers,
+            "σ₀": sigma0,
             "Ratio": round(ratio, 2),
-            "Descriptors A": len(desc_a),
-            "Descriptors B": len(desc_b),
-            "Matches": len(out[label][0]),
-            "Time (ms)": round(out[label][3], 3),
+            "Descriptors A": len(fa["desc"]),
+            "Descriptors B": len(fb["desc"]),
+            "Matches": len(i1),
+            "Median σ_B / σ_A": scale_txt,
+            "Time (ms)": round(t_ms, 3),
         }
         current_match_rows.append(row)
-        st.session_state["latest_match_runs"][(name_a, name_b, op, label)] = row
+        st.session_state["latest_match_runs"][(name_a, name_b, label)] = row
 
-    st.caption(f"Matching {op} + SIFT (σ={sift_sigma}, max {max_kp} keypoints) between `{name_a}` and `{name_b}`.")
+    st.caption(
+        f"Matching scale-invariant DoG SIFT (max {max_kp} keypoints) between "
+        f"`{name_a}` and `{name_b}`. “Median σ_B / σ_A” is the scale change between the two "
+        "images estimated from the matched keypoints."
+    )
     st.subheader("Computation time")
     st.dataframe(
         pd.DataFrame(current_match_rows),
@@ -906,8 +1022,8 @@ else:
         else:
             st.image(
                 draw_matches(
-                    img_a, sift_xa, sift_ya,
-                    img_b, sift_xb, sift_yb,
+                    img_a, fa["xs"], fa["ys"],
+                    img_b, fb["xs"], fb["ys"],
                     i1, i2, m_scores,
                     higher_is_better=higher_is_better,
                     line_thickness=st.session_state["cfg_match_line_thickness"],
@@ -917,10 +1033,10 @@ else:
                 width="stretch",
             )
 
-    st.subheader("Live comparison (latest per image pair, operator & method)")
+    st.subheader("Live comparison (latest per image pair & method)")
     visible_match_rows = [
         row
-        for (img_a_name, img_b_name, _, _), row in st.session_state["latest_match_runs"].items()
+        for (img_a_name, img_b_name, _), row in st.session_state["latest_match_runs"].items()
         if img_a_name in images and img_b_name in images
     ]
     st.dataframe(pd.DataFrame(visible_match_rows), width="stretch", hide_index=True)

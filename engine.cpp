@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -84,13 +85,80 @@ void gaussian_blur_2d(
 }
 
 // ---------------------------------------------------------------------------
-// SIFT descriptor (computed at already-detected Harris / Shi-Tomasi keypoints)
+// Scale-invariant SIFT
+//
+//   gray image -> Gaussian pyramid (octaves x layers) -> DoG pyramid
+//              -> 3-D extrema (x, y, scale) + sub-pixel/sub-scale refinement
+//              -> contrast + edge rejection  => keypoints (x, y, sigma)
+//              -> orientation(s) from the Gaussian level of the keypoint's scale
+//              -> 4x4x8 descriptor sampled with a window proportional to sigma
+//
+// Coordinate / scale conventions
+//   * Octave o has pixel size  step_o = step_0 * 2^o  (in ORIGINAL image pixels),
+//     where step_0 = 0.5 if the base image is up-sampled 2x, else 1.
+//     A point (x_o, y_o) of octave o maps to the original image as
+//     (x_o * step_o, y_o * step_o).  Up-sampling and decimation both keep pixel
+//     (0,0) fixed, so this single factor is exact.
+//   * Layer i of an octave is blurred by  sigma_i = sigma0 * 2^(i / S)  (octave
+//     pixels).  The absolute scale of a keypoint is  sigma_i * step_o, expressed in
+//     ORIGINAL image pixels.  Everything below the detector (orientation window,
+//     descriptor cell width) works in octave pixels with sigma_oct = sigma / step_o.
 // ---------------------------------------------------------------------------
 constexpr double PI_D = 3.14159265358979323846;
 constexpr int GRID = 4;                      // 4x4 spatial cells
 constexpr int NBINS = 8;                     // 8 orientation bins per cell
 constexpr int DIM = GRID * GRID * NBINS;     // 128
 constexpr int ORI_BINS = 36;                 // bins for the dominant-orientation histogram
+constexpr int SIFT_BORDER = 5;               // DoG extrema must be this far from the border
+constexpr int MAX_REFINE_ITERS = 5;
+
+struct SiftParams {
+    int    n_layers     = 3;      // S: scale samples per octave (layers 1..S hold keypoints)
+    double sigma0       = 1.6;    // blur of layer 0 of every octave (octave pixels)
+    double contrast_thr = 0.04;   // |D(x_hat)| * S must exceed this (image range [0,1])
+    double edge_thr     = 10.0;   // r in tr(H)^2/det(H) < (r+1)^2/r
+    bool   upsample     = true;   // double the image before building octave 0
+};
+
+struct Plane {
+    int h = 0, w = 0;
+    std::vector<double> d;
+    double at(int r, int c) const { return d[static_cast<size_t>(r) * w + c]; }
+};
+
+struct Octave {
+    double step = 1.0;                       // octave pixel size in original pixels
+    std::vector<Plane> gauss;                // S + 3 Gaussian levels
+    std::vector<Plane> dog;                  // S + 2 DoG levels
+    std::vector<Plane> mag, ang;             // gradients of gauss[i], filled lazily
+    std::vector<char> grad_ready;
+};
+
+struct Pyramid {
+    SiftParams p;
+    std::vector<Octave> oct;
+};
+
+// Scale-aware keypoint. x, y, sigma are in ORIGINAL image pixels.
+struct SiftKeypoint {
+    double x = 0.0;
+    double y = 0.0;
+    double sigma = 0.0;          // characteristic scale
+    double orientation = 0.0;    // radians in [0, 2*pi)
+    double response = 0.0;       // |DoG| at the refined extremum
+    int octave = 0;              // pyramid location, needed to fetch the right Gaussian level
+    int layer = 1;
+};
+
+SiftParams make_params(int n_layers, double sigma0, double contrast_thr, double edge_thr, int upsample) {
+    SiftParams p;
+    p.n_layers = (n_layers < 1) ? 3 : std::min(n_layers, 8);
+    p.sigma0 = (sigma0 <= 0.0) ? 1.6 : std::max(sigma0, 0.5);
+    p.contrast_thr = (contrast_thr <= 0.0) ? 0.04 : contrast_thr;
+    p.edge_thr = (edge_thr <= 1.0) ? 10.0 : edge_thr;
+    p.upsample = (upsample != 0);
+    return p;
+}
 
 // Grayscale in [0,1]; RGB uses luminance
 void to_gray(const uint8_t* img, int h, int w, int ch, std::vector<double>& g) {
@@ -121,46 +189,350 @@ void gradient_maps(const std::vector<double>& g, int h, int w,
     }
 }
 
-// Step 1 - orientation: Gaussian-weighted histogram of gradient angles around the
-// keypoint; the strongest bin is the keypoint's dominant orientation.
-double dominant_orientation(const std::vector<double>& mag, const std::vector<double>& ang,
-                            int h, int w, int x, int y, double sigma) {
-    double s = 1.5 * sigma;
-    int rad = static_cast<int>(std::round(3.0 * s));
+// ----------------------------- Gaussian pyramid -----------------------------
+
+Plane blur_plane(const Plane& src, double sigma) {
+    Plane dst;
+    dst.h = src.h;
+    dst.w = src.w;
+    dst.d.resize(src.d.size());
+    std::vector<double> temp(src.d.size());
+    int ksize = 2 * static_cast<int>(std::ceil(3.0 * sigma)) + 1;
+    gaussian_blur_2d(src.d, dst.d, temp, src.h, src.w, make_gaussian_kernel_1d(ksize, sigma));
+    return dst;
+}
+
+// Bilinear 2x up-sampling; output pixel (2r, 2c) == input pixel (r, c)
+Plane upsample2x(const Plane& s) {
+    Plane o;
+    o.h = 2 * s.h;
+    o.w = 2 * s.w;
+    o.d.resize(static_cast<size_t>(o.h) * o.w);
+    for (int r = 0; r < o.h; ++r) {
+        double sr = 0.5 * r;
+        int r0 = static_cast<int>(sr);
+        int r1 = std::min(r0 + 1, s.h - 1);
+        double fr = sr - r0;
+        for (int c = 0; c < o.w; ++c) {
+            double sc = 0.5 * c;
+            int c0 = static_cast<int>(sc);
+            int c1 = std::min(c0 + 1, s.w - 1);
+            double fc = sc - c0;
+            double top = s.at(r0, c0) * (1.0 - fc) + s.at(r0, c1) * fc;
+            double bot = s.at(r1, c0) * (1.0 - fc) + s.at(r1, c1) * fc;
+            o.d[static_cast<size_t>(r) * o.w + c] = top * (1.0 - fr) + bot * fr;
+        }
+    }
+    return o;
+}
+
+// Keep every second pixel: output (r, c) == input (2r, 2c)
+Plane downsample2x(const Plane& s) {
+    Plane o;
+    o.h = s.h / 2;
+    o.w = s.w / 2;
+    o.d.resize(static_cast<size_t>(o.h) * o.w);
+    for (int r = 0; r < o.h; ++r)
+        for (int c = 0; c < o.w; ++c)
+            o.d[static_cast<size_t>(r) * o.w + c] = s.at(2 * r, 2 * c);
+    return o;
+}
+
+// Returns an empty pyramid if the image is too small to hold a DoG extremum.
+Pyramid build_pyramid(const std::vector<double>& gray, int h, int w, const SiftParams& p) {
+    Pyramid pyr;
+    pyr.p = p;
+
+    Plane base;
+    base.h = h;
+    base.w = w;
+    base.d = gray;
+    double assumed_blur = 0.5;   // nominal blur of the camera image
+    double step0 = 1.0;
+    if (p.upsample) {
+        base = upsample2x(base);
+        assumed_blur = 1.0;      // 0.5 doubled
+        step0 = 0.5;
+    }
+    int min_dim = std::min(base.h, base.w);
+    if (min_dim < 2 * SIFT_BORDER + 2) return pyr;
+
+    // smallest octave keeps at least ~16 pixels on its short side
+    int n_oct = static_cast<int>(std::floor(std::log2(min_dim / 16.0))) + 1;
+    if (n_oct < 1) n_oct = 1;
+
+    const int S = p.n_layers;
+    const double k = std::pow(2.0, 1.0 / S);
+    const double sd0 = std::sqrt(std::max(p.sigma0 * p.sigma0 - assumed_blur * assumed_blur, 0.01));
+    Plane cur = blur_plane(base, sd0);              // sigma = sigma0 in octave-0 pixels
+
+    for (int o = 0; o < n_oct; ++o) {
+        Octave oc;
+        oc.step = step0 * std::ldexp(1.0, o);
+        oc.gauss.reserve(S + 3);
+        oc.gauss.push_back(cur);
+
+        // incremental blur: sigma_i^2 = sigma_{i-1}^2 + inc^2  with sigma_i = sigma0 * k^i
+        double sig_prev = p.sigma0;
+        for (int i = 1; i < S + 3; ++i) {
+            double inc = sig_prev * std::sqrt(k * k - 1.0);
+            Plane next = blur_plane(oc.gauss.back(), inc);
+            oc.gauss.push_back(std::move(next));
+            sig_prev *= k;
+        }
+
+        // DoG_i = G_{i+1} - G_i
+        for (int i = 0; i < S + 2; ++i) {
+            Plane d;
+            d.h = oc.gauss[i].h;
+            d.w = oc.gauss[i].w;
+            d.d.resize(oc.gauss[i].d.size());
+            for (size_t j = 0; j < d.d.size(); ++j) d.d[j] = oc.gauss[i + 1].d[j] - oc.gauss[i].d[j];
+            oc.dog.push_back(std::move(d));
+        }
+
+        // Layer S has sigma = 2*sigma0; decimating it gives sigma0 in the next octave's pixels
+        if (o + 1 < n_oct) cur = downsample2x(oc.gauss[S]);
+        pyr.oct.push_back(std::move(oc));
+    }
+    return pyr;
+}
+
+void ensure_gradients(Octave& oc, int layer) {
+    if (oc.mag.empty()) {
+        oc.mag.resize(oc.gauss.size());
+        oc.ang.resize(oc.gauss.size());
+        oc.grad_ready.assign(oc.gauss.size(), 0);
+    }
+    if (!oc.grad_ready[layer]) {
+        const Plane& g = oc.gauss[layer];
+        oc.mag[layer].h = oc.ang[layer].h = g.h;
+        oc.mag[layer].w = oc.ang[layer].w = g.w;
+        gradient_maps(g.d, g.h, g.w, oc.mag[layer].d, oc.ang[layer].d);
+        oc.grad_ready[layer] = 1;
+    }
+}
+
+// ----------------------------- DoG extrema detection -----------------------------
+
+// Fit a 3-D quadratic to the DoG around (l, r, c), iterating while the offset exceeds 0.5.
+// On success l/r/c hold the final integer location, off_* the sub-sample offset and
+// `contrast` the interpolated DoG value. Also applies the edge (Hessian ratio) test.
+bool refine_extremum(const Octave& oc, const SiftParams& p, int& l, int& r, int& c,
+                     double& off_s, double& off_r, double& off_c, double& contrast) {
+    const int S = p.n_layers;
+    const int h = oc.dog[0].h, w = oc.dog[0].w;
+
+    for (int it = 0; it < MAX_REFINE_ITERS; ++it) {
+        if (l < 1 || l > S || r < SIFT_BORDER || r >= h - SIFT_BORDER ||
+            c < SIFT_BORDER || c >= w - SIFT_BORDER) return false;
+
+        const Plane& prv = oc.dog[l - 1];
+        const Plane& cur = oc.dog[l];
+        const Plane& nxt = oc.dog[l + 1];
+
+        double gx = 0.5 * (cur.at(r, c + 1) - cur.at(r, c - 1));
+        double gy = 0.5 * (cur.at(r + 1, c) - cur.at(r - 1, c));
+        double gs = 0.5 * (nxt.at(r, c) - prv.at(r, c));
+
+        double v2 = 2.0 * cur.at(r, c);
+        double dxx = cur.at(r, c + 1) + cur.at(r, c - 1) - v2;
+        double dyy = cur.at(r + 1, c) + cur.at(r - 1, c) - v2;
+        double dss = nxt.at(r, c) + prv.at(r, c) - v2;
+        double dxy = 0.25 * (cur.at(r + 1, c + 1) - cur.at(r + 1, c - 1) -
+                             cur.at(r - 1, c + 1) + cur.at(r - 1, c - 1));
+        double dxs = 0.25 * (nxt.at(r, c + 1) - nxt.at(r, c - 1) -
+                             prv.at(r, c + 1) + prv.at(r, c - 1));
+        double dys = 0.25 * (nxt.at(r + 1, c) - nxt.at(r - 1, c) -
+                             prv.at(r + 1, c) + prv.at(r - 1, c));
+
+        // Solve H * X = -g (X = [dx, dy, ds]) with Cramer's rule
+        double b0 = -gx, b1 = -gy, b2 = -gs;
+        double det = dxx * (dyy * dss - dys * dys) - dxy * (dxy * dss - dys * dxs) +
+                     dxs * (dxy * dys - dyy * dxs);
+        if (std::fabs(det) < 1e-18) return false;
+        double det0 = b0 * (dyy * dss - dys * dys) - dxy * (b1 * dss - dys * b2) +
+                      dxs * (b1 * dys - dyy * b2);
+        double det1 = dxx * (b1 * dss - dys * b2) - b0 * (dxy * dss - dys * dxs) +
+                      dxs * (dxy * b2 - b1 * dxs);
+        double det2 = dxx * (dyy * b2 - b1 * dys) - dxy * (dxy * b2 - b1 * dxs) +
+                      b0 * (dxy * dys - dyy * dxs);
+        off_c = det0 / det;
+        off_r = det1 / det;
+        off_s = det2 / det;
+
+        if (std::fabs(off_c) < 0.5 && std::fabs(off_r) < 0.5 && std::fabs(off_s) < 0.5) {
+            // converged: low-contrast test on the interpolated extremum value
+            contrast = cur.at(r, c) + 0.5 * (gx * off_c + gy * off_r + gs * off_s);
+            if (std::fabs(contrast) * S < p.contrast_thr) return false;
+
+            // edge rejection from the 2x2 spatial Hessian: tr^2 / det < (r+1)^2 / r
+            double tr = dxx + dyy;
+            double det2d = dxx * dyy - dxy * dxy;
+            double rr = p.edge_thr;
+            if (det2d <= 0.0 || tr * tr * rr >= (rr + 1.0) * (rr + 1.0) * det2d) return false;
+            return true;
+        }
+
+        // jump to the neighbouring sample the quadratic points at (bounded to avoid huge jumps)
+        if (std::fabs(off_c) > 1e4 || std::fabs(off_r) > 1e4 || std::fabs(off_s) > 1e4) return false;
+        c += static_cast<int>(std::lround(off_c));
+        r += static_cast<int>(std::lround(off_r));
+        l += static_cast<int>(std::lround(off_s));
+    }
+    return false;   // did not converge
+}
+
+// 26-neighbour test in (x, y, scale)
+bool is_scale_space_extremum(const Octave& oc, int l, int r, int c) {
+    const double v = oc.dog[l].at(r, c);
+    const bool is_max = v > 0.0;
+    for (int ds = -1; ds <= 1; ++ds) {
+        const Plane& pl = oc.dog[l + ds];
+        for (int dr = -1; dr <= 1; ++dr) {
+            for (int dc = -1; dc <= 1; ++dc) {
+                if (ds == 0 && dr == 0 && dc == 0) continue;
+                double nb = pl.at(r + dr, c + dc);
+                if (is_max ? (nb > v) : (nb < v)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Detect DoG keypoints (position + characteristic scale; orientation is assigned later).
+std::vector<SiftKeypoint> detect_dog_extrema(const Pyramid& pyr) {
+    std::vector<SiftKeypoint> kps;
+    const SiftParams& p = pyr.p;
+    const int S = p.n_layers;
+    const double prelim = 0.5 * p.contrast_thr / S;     // cheap pre-filter before refinement
+
+    for (size_t o = 0; o < pyr.oct.size(); ++o) {
+        const Octave& oc = pyr.oct[o];
+        const int h = oc.dog[0].h, w = oc.dog[0].w;
+        size_t first = kps.size();
+
+        for (int l = 1; l <= S; ++l) {
+            for (int r = SIFT_BORDER; r < h - SIFT_BORDER; ++r) {
+                for (int c = SIFT_BORDER; c < w - SIFT_BORDER; ++c) {
+                    double v = oc.dog[l].at(r, c);
+                    if (std::fabs(v) <= prelim) continue;
+                    if (!is_scale_space_extremum(oc, l, r, c)) continue;
+
+                    int ll = l, rr = r, cc = c;
+                    double os = 0, orow = 0, ocol = 0, contrast = 0;
+                    if (!refine_extremum(oc, p, ll, rr, cc, os, orow, ocol, contrast)) continue;
+
+                    SiftKeypoint kp;
+                    double sigma_oct = p.sigma0 * std::pow(2.0, (ll + os) / S);
+                    kp.x = (cc + ocol) * oc.step;               // octave -> original image
+                    kp.y = (rr + orow) * oc.step;
+                    kp.sigma = sigma_oct * oc.step;
+                    kp.response = std::fabs(contrast);
+                    kp.octave = static_cast<int>(o);
+                    kp.layer = ll;
+                    kps.push_back(kp);
+                }
+            }
+        }
+
+        // different candidates can converge to the same refined extremum: drop exact repeats
+        std::sort(kps.begin() + first, kps.end(), [](const SiftKeypoint& a, const SiftKeypoint& b) {
+            if (a.layer != b.layer) return a.layer < b.layer;
+            if (a.y != b.y) return a.y < b.y;
+            if (a.x != b.x) return a.x < b.x;
+            return a.sigma < b.sigma;
+        });
+        auto same = [](const SiftKeypoint& a, const SiftKeypoint& b) {
+            return a.layer == b.layer && a.x == b.x && a.y == b.y && a.sigma == b.sigma;
+        };
+        kps.erase(std::unique(kps.begin() + first, kps.end(), same), kps.end());
+    }
+    return kps;
+}
+
+// ----------------------------- Orientation -----------------------------
+
+// Step 1 - orientation. `x`, `y`, `sigma` are in the pixels of the gradient maps (octave
+// pixels) and `sigma` is THIS keypoint's scale: the Gaussian window has sigma_w = 1.5*sigma
+// and radius 3*sigma_w, so the neighbourhood grows with the keypoint scale. Returns every
+// histogram peak >= 80% of the maximum (strongest first), each refined by a parabola.
+void dominant_orientations(const std::vector<double>& mag, const std::vector<double>& ang,
+                           int h, int w, double x, double y, double sigma,
+                           std::vector<double>& out) {
+    out.clear();
+    const double s = 1.5 * sigma;
+    const int rad = std::max(1, static_cast<int>(std::lround(3.0 * s)));
+    const int cx = static_cast<int>(std::lround(x)), cy = static_cast<int>(std::lround(y));
     double hist[ORI_BINS] = {0};
 
-    for (int dy = -rad; dy <= rad; ++dy) {
-        int r = y + dy;
+    for (int r = cy - rad; r <= cy + rad; ++r) {
         if (r < 1 || r >= h - 1) continue;
-        for (int dx = -rad; dx <= rad; ++dx) {
-            int c = x + dx;
+        double dy = r - y;
+        for (int c = cx - rad; c <= cx + rad; ++c) {
             if (c < 1 || c >= w - 1) continue;
+            double dx = c - x;
+            double d2 = dx * dx + dy * dy;
+            if (d2 > static_cast<double>(rad) * rad) continue;          // circular window
             size_t i = static_cast<size_t>(r) * w + c;
             int bin = static_cast<int>(ang[i] * ORI_BINS / (2.0 * PI_D)) % ORI_BINS;
-            hist[bin] += std::exp(-(dx * dx + dy * dy) / (2.0 * s * s)) * mag[i];
+            hist[bin] += std::exp(-d2 / (2.0 * s * s)) * mag[i];
         }
     }
 
+    // circular smoothing with [1 4 6 4 1] / 16
+    double sm[ORI_BINS];
+    for (int i = 0; i < ORI_BINS; ++i) {
+        sm[i] = (hist[(i + ORI_BINS - 2) % ORI_BINS] + hist[(i + 2) % ORI_BINS]
+                 + 4.0 * (hist[(i + ORI_BINS - 1) % ORI_BINS] + hist[(i + 1) % ORI_BINS])
+                 + 6.0 * hist[i]) / 16.0;
+    }
+
     int best = 0;
-    for (int i = 1; i < ORI_BINS; ++i) if (hist[i] > hist[best]) best = i;
-    return (best + 0.5) * 2.0 * PI_D / ORI_BINS;
+    for (int i = 1; i < ORI_BINS; ++i) if (sm[i] > sm[best]) best = i;
+    const double bin_w = 2.0 * PI_D / ORI_BINS;
+    if (sm[best] <= 1e-12) { out.push_back(0.0); return; }      // flat patch
+
+    std::vector<std::pair<double, double>> peaks;               // (strength, angle)
+    for (int i = 0; i < ORI_BINS; ++i) {
+        double l = sm[(i + ORI_BINS - 1) % ORI_BINS], c = sm[i], rg = sm[(i + 1) % ORI_BINS];
+        if (c > l && c >= rg && c >= 0.8 * sm[best]) {
+            double denom = l - 2.0 * c + rg;
+            double d = (denom < -1e-18) ? 0.5 * (l - rg) / denom : 0.0;
+            d = std::min(0.5, std::max(-0.5, d));
+            double a = (i + 0.5 + d) * bin_w;                   // bin i spans [i, i+1) * bin_w
+            a = std::fmod(a + 2.0 * PI_D, 2.0 * PI_D);
+            peaks.emplace_back(c, a);
+        }
+    }
+    if (peaks.empty()) peaks.emplace_back(sm[best], (best + 0.5) * bin_w);
+    std::sort(peaks.begin(), peaks.end(),
+              [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                  return a.first > b.first;
+              });
+    for (const auto& pk : peaks) out.push_back(pk.second);
 }
 
-// Step 2 - descriptor: rotate the patch to the dominant orientation, split it into
-// 4x4 cells, build an 8-bin gradient-orientation histogram per cell (128 values).
+// ----------------------------- Descriptor -----------------------------
+
+// Step 2 - descriptor. (x, y, sigma) are in the pixels of the gradient maps; `sigma` is the
+// keypoint's own scale, so the cell width (3*sigma) and the sampling radius scale with it.
+// The patch is rotated to `theta`, split into 4x4 cells and an 8-bin gradient histogram is
+// accumulated per cell with trilinear interpolation (128 values).
 void sift_descriptor(const std::vector<double>& mag, const std::vector<double>& ang,
-                     int h, int w, int x, int y, double sigma, double theta, float* out) {
-    double cell = 3.0 * sigma;                                    // cell width in pixels
-    int rad = static_cast<int>(std::round(cell * std::sqrt(2.0) * (GRID + 1) * 0.5));
-    double ct = std::cos(theta), st = std::sin(theta);
+                     int h, int w, double x, double y, double sigma, double theta, float* out) {
+    const double cell = 3.0 * sigma;                              // cell width in pixels
+    const int rad = static_cast<int>(std::lround(cell * std::sqrt(2.0) * (GRID + 1) * 0.5));
+    const double ct = std::cos(theta), st = std::sin(theta);
+    const int cx = static_cast<int>(std::lround(x)), cy = static_cast<int>(std::lround(y));
     double hist[GRID][GRID][NBINS] = {};
 
-    for (int dy = -rad; dy <= rad; ++dy) {
-        int r = y + dy;
+    for (int r = cy - rad; r <= cy + rad; ++r) {
         if (r < 1 || r >= h - 1) continue;
-        for (int dx = -rad; dx <= rad; ++dx) {
-            int c = x + dx;
+        double dy = r - y;                                        // sub-pixel accurate offsets
+        for (int c = cx - rad; c <= cx + rad; ++c) {
             if (c < 1 || c >= w - 1) continue;
+            double dx = c - x;
 
             // sample position in the rotated frame, in cell units (centered on keypoint)
             double u = ( ct * dx + st * dy) / cell;               // column direction
@@ -173,8 +545,9 @@ void sift_descriptor(const std::vector<double>& mag, const std::vector<double>& 
             double a = ang[i] - theta;                            // angle relative to keypoint
             if (a < 0) a += 2.0 * PI_D;
             double ob = a * NBINS / (2.0 * PI_D);
+            if (ob >= NBINS) ob -= NBINS;
 
-            // weight = gradient magnitude * Gaussian centered on the keypoint
+            // weight = gradient magnitude * Gaussian (sigma = GRID/2 cells) centered on keypoint
             double wgt = mag[i] * std::exp(-(u * u + v * v) / (0.5 * GRID * GRID));
 
             // trilinear split between the neighbouring row / column / orientation bins
@@ -211,6 +584,38 @@ void sift_descriptor(const std::vector<double>& mag, const std::vector<double>& 
         }
     }
     for (int i = 0; i < DIM; ++i) out[i] = static_cast<float>(d[i]);
+}
+
+// Describe one keypoint using ITS OWN octave / layer / sigma / orientation.
+void describe_keypoint(Pyramid& pyr, const SiftKeypoint& kp, float* out) {
+    Octave& oc = pyr.oct[kp.octave];
+    ensure_gradients(oc, kp.layer);
+    const Plane& m = oc.mag[kp.layer];
+    const Plane& a = oc.ang[kp.layer];
+    sift_descriptor(m.d, a.d, m.h, m.w, kp.x / oc.step, kp.y / oc.step,
+                    kp.sigma / oc.step, kp.orientation, out);
+}
+
+// Assign one or more orientations to every keypoint (a keypoint with several strong
+// orientation peaks is duplicated, one copy per orientation, as in Lowe's SIFT).
+std::vector<SiftKeypoint> assign_orientations(Pyramid& pyr, const std::vector<SiftKeypoint>& in) {
+    std::vector<SiftKeypoint> out;
+    std::vector<double> thetas;
+    out.reserve(in.size());
+    for (const SiftKeypoint& kp : in) {
+        Octave& oc = pyr.oct[kp.octave];
+        ensure_gradients(oc, kp.layer);
+        const Plane& m = oc.mag[kp.layer];
+        const Plane& a = oc.ang[kp.layer];
+        dominant_orientations(m.d, a.d, m.h, m.w, kp.x / oc.step, kp.y / oc.step,
+                              kp.sigma / oc.step, thetas);
+        for (double t : thetas) {
+            SiftKeypoint k2 = kp;
+            k2.orientation = t;
+            out.push_back(k2);
+        }
+    }
+    return out;
 }
 
 } // namespace
@@ -402,49 +807,82 @@ EXPORT int detect_corners(
 }
 
 /**
- * 128-D SIFT descriptors at given keypoints (e.g. from detect_corners).
- * Pipeline: grayscale -> Gaussian blur (sigma) -> gradients -> per keypoint:
- *           dominant orientation -> rotated 4x4x8 histogram -> normalize/clip.
- * Harris is single-scale, so all keypoints use the same descriptor scale `sigma`.
+ * Scale-invariant SIFT: DoG keypoint detection (+ optional descriptors) in one pass.
+ * Pipeline: gray -> Gaussian/DoG pyramid -> 3-D extrema -> sub-pixel/scale refinement ->
+ *           contrast + edge rejection -> orientation(s) -> 128-D descriptors.
+ * The pyramid is built once and shared by detection, orientation and description.
  *
- * @param out_desc    n_kp * 128 floats
- * @param out_orient  n_kp doubles (orientation in radians) or nullptr
- * @return            n_kp (0 on invalid input)
+ * Keypoints are sorted by DoG response (strongest first) and truncated to max_kp.
+ * A keypoint with several strong orientations appears once per orientation.
+ *
+ * @param n_layers      S, scale samples per octave (<= 0 -> 3)
+ * @param sigma0        base blur of each octave (<= 0 -> 1.6)
+ * @param contrast_thr  contrast threshold, image range [0,1] (<= 0 -> 0.04)
+ * @param edge_thr      edge ratio r (<= 1 -> 10)
+ * @param upsample      non-zero: double the image first (finds the smallest features)
+ * @param max_kp        capacity of every output buffer
+ * @param out_x/out_y   keypoint position in ORIGINAL image pixels   (nullable)
+ * @param out_sigma     characteristic scale in ORIGINAL image pixels  (nullable)
+ * @param out_orient    orientation in radians [0, 2pi)                 (nullable)
+ * @param out_response  |DoG| at the refined extremum                   (nullable)
+ * @param out_desc      max_kp * 128 floats; nullptr = detect only      (nullable)
+ * @return              number of keypoints written
  */
-EXPORT int compute_sift_descriptors(
+EXPORT int detect_and_describe_sift(
     const uint8_t* img_data, int height, int width, int channels,
-    const int* kp_x, const int* kp_y, int n_kp, double sigma,
-    float* out_desc, double* out_orient, double* out_time_ms
+    int n_layers, double sigma0, double contrast_thr, double edge_thr, int upsample,
+    int max_kp,
+    double* out_x, double* out_y, double* out_sigma, double* out_orient, double* out_response,
+    float* out_desc, double* out_time_ms
 ) {
-    if (!img_data || !kp_x || !kp_y || !out_desc || height < 3 || width < 3 ||
-        (channels != 1 && channels != 3) || n_kp <= 0) {
+    if (!img_data || height < 3 || width < 3 || (channels != 1 && channels != 3) || max_kp <= 0) {
         if (out_time_ms) *out_time_ms = 0.0;
         return 0;
     }
-    if (sigma < 0.5) sigma = 0.5;
-
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    std::vector<double> gray, smooth(static_cast<size_t>(height) * width), temp(smooth.size());
+    SiftParams p = make_params(n_layers, sigma0, contrast_thr, edge_thr, upsample);
+    std::vector<double> gray;
     to_gray(img_data, height, width, channels, gray);
-    int ksize = 2 * static_cast<int>(std::ceil(3.0 * sigma)) + 1;
-    gaussian_blur_2d(gray, smooth, temp, height, width, make_gaussian_kernel_1d(ksize, sigma));
+    Pyramid pyr = build_pyramid(gray, height, width, p);
 
-    std::vector<double> mag, ang;
-    gradient_maps(smooth, height, width, mag, ang);
-
-    for (int i = 0; i < n_kp; ++i) {
-        int x = clamp_idx(kp_x[i], width);
-        int y = clamp_idx(kp_y[i], height);
-        double theta = dominant_orientation(mag, ang, height, width, x, y, sigma);
-        sift_descriptor(mag, ang, height, width, x, y, sigma, theta,
-                        out_desc + static_cast<size_t>(i) * DIM);
-        if (out_orient) out_orient[i] = theta;
+    int count = 0;
+    if (!pyr.oct.empty()) {
+        std::vector<SiftKeypoint> kps = assign_orientations(pyr, detect_dog_extrema(pyr));
+        std::stable_sort(kps.begin(), kps.end(), [](const SiftKeypoint& a, const SiftKeypoint& b) {
+            return a.response > b.response;
+        });
+        count = std::min(static_cast<int>(kps.size()), max_kp);
+        for (int i = 0; i < count; ++i) {
+            const SiftKeypoint& kp = kps[i];
+            if (out_x) out_x[i] = kp.x;
+            if (out_y) out_y[i] = kp.y;
+            if (out_sigma) out_sigma[i] = kp.sigma;
+            if (out_orient) out_orient[i] = kp.orientation;
+            if (out_response) out_response[i] = kp.response;
+            if (out_desc) describe_keypoint(pyr, kp, out_desc + static_cast<size_t>(i) * DIM);
+        }
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
     if (out_time_ms) *out_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    return n_kp;
+    return count;
+}
+
+/**
+ * DoG keypoint detection only (no descriptors). See detect_and_describe_sift.
+ */
+EXPORT int detect_sift_keypoints(
+    const uint8_t* img_data, int height, int width, int channels,
+    int n_layers, double sigma0, double contrast_thr, double edge_thr, int upsample,
+    int max_kp,
+    double* out_x, double* out_y, double* out_sigma, double* out_orient, double* out_response,
+    double* out_time_ms
+) {
+    return detect_and_describe_sift(img_data, height, width, channels, n_layers, sigma0,
+                                    contrast_thr, edge_thr, upsample, max_kp,
+                                    out_x, out_y, out_sigma, out_orient, out_response,
+                                    nullptr, out_time_ms);
 }
 
 /**
@@ -510,7 +948,7 @@ EXPORT int match_descriptors(
             else if (acc < second) { second = acc; }
         }
 
-        if (best_j < 0 || best > r * second) continue;   // ambiguous match -> reject
+        if (best_j < 0 || (ratio < 1.0 && best >= r * second)) continue;   // ambiguous match -> reject
         out_i[count] = i;
         out_j[count] = best_j;
         out_score[count] = (method == 0) ? best : 1.0 - best;
